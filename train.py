@@ -1,98 +1,42 @@
 """
 train.py
 --------
-Training loop for the Lightweight UNet++ actin-edge segmentation model.
+Training loop shared by all three team-member models. Select which model
+to train with the --model flag:
+
+    python train.py --model unetpp               # Member A: BCE + Dice loss
+    python train.py --model attention_unet        # Member B: Tversky loss
+    python train.py --model resunetpp              # Member C: Combo loss
+    python train.py --all                          # train all three sequentially
+
+Each model gets its own checkpoint file and training-history CSV (see
+config.MODEL_REGISTRY), so all three can be trained independently and then
+benchmarked side by side in evaluate.py / the final report.
 
 Features:
-  - Combined BCEWithLogits + Dice loss (config.BCE_WEIGHT / config.DICE_WEIGHT)
-  - Deep supervision: loss is computed and averaged across ALL decoder
-    output depths returned by the model when config.USE_DEEP_SUPERVISION=True
+  - Loss function automatically selected per model (utils/losses.py)
+  - Deep supervision handled transparently for models that use it (UNet++)
   - Per-epoch training & validation loss + Dice coefficient tracking
   - Model checkpointing (saves best validation Dice)
   - Early stopping
-  - Saves a training_history.csv (loss/dice per epoch) for later plotting
-    (e.g. the box-plot / benchmarking figures required in the final report)
 """
 
 import os
 import csv
 import time
 import copy
+import argparse
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
 import config
 from dataset import get_dataloaders
-from models.unet_plus_plus import LightUNetPlusPlus, count_parameters
+from model_builder import build_model, build_loss, get_final_output, compute_loss
+from utils.losses import dice_coefficient
 
 
-def dice_coefficient(pred_logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Computes the Sørensen-Dice coefficient between a predicted probability
-    map (after sigmoid) and a binary target mask.
-
-    Dice = 2 * |A ∩ B| / (|A| + |B|)
-
-    Parameters
-    ----------
-    pred_logits : torch.Tensor
-        Raw (pre-sigmoid) model output, shape (B, 1, H, W).
-    target : torch.Tensor
-        Binary ground-truth mask, shape (B, 1, H, W), values in {0, 1}.
-
-    Returns
-    -------
-    torch.Tensor
-        Scalar mean Dice coefficient over the batch.
-    """
-    pred = torch.sigmoid(pred_logits)
-    pred_flat = pred.view(pred.size(0), -1)
-    target_flat = target.view(target.size(0), -1)
-
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
-
-    dice = (2.0 * intersection + eps) / (union + eps)
-    return dice.mean()
-
-
-def dice_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Dice loss = 1 - Dice coefficient (to be minimized)."""
-    return 1.0 - dice_coefficient(pred_logits, target)
-
-
-def combined_loss(outputs, target: torch.Tensor, bce_fn: nn.Module) -> torch.Tensor:
-    """
-    Computes the combined BCE + Dice loss, averaged across every
-    deep-supervision output if the model returns a list of logits
-    (one per decoder depth), or computed directly if it returns a
-    single tensor.
-
-    total_loss = BCE_WEIGHT * BCEWithLogitsLoss + DICE_WEIGHT * DiceLoss
-    """
-    if isinstance(outputs, (list, tuple)):
-        losses = []
-        for out in outputs:
-            bce = bce_fn(out, target)
-            d_loss = dice_loss(out, target)
-            losses.append(config.BCE_WEIGHT * bce + config.DICE_WEIGHT * d_loss)
-        return torch.stack(losses).mean()
-    else:
-        bce = bce_fn(outputs, target)
-        d_loss = dice_loss(outputs, target)
-        return config.BCE_WEIGHT * bce + config.DICE_WEIGHT * d_loss
-
-
-def get_final_output(outputs):
-    """Extracts the final (deepest / most refined) prediction for Dice metric reporting."""
-    if isinstance(outputs, (list, tuple)):
-        return outputs[-1]
-    return outputs
-
-
-def run_epoch(model, loader, optimizer, bce_fn, device, train: bool = True):
+def run_epoch(model, model_name, loader, optimizer, loss_fn, device, train: bool = True):
     """
     Runs one full pass over `loader`, either in training mode (with
     backprop) or evaluation mode (no gradient updates).
@@ -114,7 +58,7 @@ def run_epoch(model, loader, optimizer, bce_fn, device, train: bool = True):
                 optimizer.zero_grad()
 
             outputs = model(images)
-            loss = combined_loss(outputs, masks, bce_fn)
+            loss = compute_loss(model_name, loss_fn, outputs, masks)
 
             if train:
                 loss.backward()
@@ -130,32 +74,34 @@ def run_epoch(model, loader, optimizer, bce_fn, device, train: bool = True):
     return total_loss / max(n_batches, 1), total_dice / max(n_batches, 1)
 
 
-def train_model():
+def train_model(model_name: str = None):
     """
-    Main training entry point. Builds dataloaders, model, optimizer, then
-    runs the training loop with validation, checkpointing, early stopping,
-    and CSV history logging.
+    Main training entry point for one of the three registered models.
     """
+    model_name = model_name or config.DEFAULT_MODEL
+    if model_name not in config.MODEL_REGISTRY:
+        raise ValueError(f"Unknown model {model_name!r}. Choose from {list(config.MODEL_REGISTRY.keys())}")
+
+    registry_entry = config.MODEL_REGISTRY[model_name]
     device = config.DEVICE
+
+    print(f"=== Training {registry_entry['display_name']} (model_name='{model_name}') ===")
     print(f"Using device: {device}")
+    print(f"Loss function: {registry_entry['loss']}")
 
     train_loader, val_loader = get_dataloaders()
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
-    model = LightUNetPlusPlus(
-        in_channels=config.IN_CHANNELS,
-        out_channels=config.OUT_CHANNELS,
-        base_filters=config.BASE_FILTERS,
-        depth=config.DEPTH,
-        deep_supervision=config.USE_DEEP_SUPERVISION,
-    ).to(device)
-    print(f"Model parameter count: {count_parameters(model):,}")
+    model = build_model(model_name)
+    loss_fn = build_loss(model_name)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameter count: {n_params:,}")
 
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE,
                             weight_decay=config.WEIGHT_DECAY)
-    bce_fn = nn.BCEWithLogitsLoss()
 
-    history_path = os.path.join(config.OUTPUT_DIR, "training_history.csv")
+    history_path = os.path.join(config.OUTPUT_DIR, f"training_history_{model_name}.csv")
     with open(history_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "train_dice", "val_loss", "val_dice",
@@ -167,8 +113,8 @@ def train_model():
 
     for epoch in range(1, config.NUM_EPOCHS + 1):
         t0 = time.time()
-        train_loss, train_dice = run_epoch(model, train_loader, optimizer, bce_fn, device, train=True)
-        val_loss, val_dice = run_epoch(model, val_loader, optimizer, bce_fn, device, train=False)
+        train_loss, train_dice = run_epoch(model, model_name, train_loader, optimizer, loss_fn, device, train=True)
+        val_loss, val_dice = run_epoch(model, model_name, val_loader, optimizer, loss_fn, device, train=False)
         epoch_time = time.time() - t0
 
         print(f"Epoch {epoch:03d}/{config.NUM_EPOCHS} | "
@@ -184,16 +130,13 @@ def train_model():
             best_val_dice = val_dice
             best_model_state = copy.deepcopy(model.state_dict())
             epochs_without_improvement = 0
-            ckpt_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+            ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
             torch.save({
                 "epoch": epoch,
+                "model_name": model_name,
                 "model_state_dict": best_model_state,
                 "val_dice": best_val_dice,
-                "config": {
-                    "base_filters": config.BASE_FILTERS,
-                    "depth": config.DEPTH,
-                    "deep_supervision": config.USE_DEEP_SUPERVISION,
-                },
+                "num_parameters": n_params,
             }, ckpt_path)
             print(f"  -> New best model saved (val_dice={best_val_dice:.4f}) at {ckpt_path}")
         else:
@@ -204,10 +147,23 @@ def train_model():
                   f"(no improvement for {config.EARLY_STOP_PATIENCE} epochs).")
             break
 
-    print(f"Training complete. Best validation Dice: {best_val_dice:.4f}")
+    print(f"Training complete for {model_name}. Best validation Dice: {best_val_dice:.4f}")
     print(f"Training history saved to: {history_path}")
     return model, history_path
 
 
 if __name__ == "__main__":
-    train_model()
+    parser = argparse.ArgumentParser(description="Train one of the three team-member segmentation models.")
+    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
+                         choices=list(config.MODEL_REGISTRY.keys()),
+                         help="Which model to train: unetpp (Member A), attention_unet (Member B), "
+                              "resunetpp (Member C).")
+    parser.add_argument("--all", action="store_true",
+                         help="Train all three registered models sequentially.")
+    args = parser.parse_args()
+
+    if args.all:
+        for name in config.MODEL_REGISTRY.keys():
+            train_model(name)
+    else:
+        train_model(args.model)

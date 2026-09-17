@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 
 import config
-from utils.hog_processing import compute_boundary_band_mask
+from utils.hog_processing import compute_boundary_band_mask, hog_guided_boundary_refinement
 
 
 def load_tif_image(path: str) -> np.ndarray:
@@ -62,31 +62,46 @@ def load_tif_image(path: str) -> np.ndarray:
 
 def preprocess_image(img: np.ndarray):
     """
-    Runs the full Step-1 preprocessing chain on a single normalized image.
+    Runs the full classical labeling pipeline on a single normalized image.
+    This IS the labeling method for this project (no manual/Roboflow
+    annotation is used) -- it deterministically converts a raw intensity
+    image into a binary actin-edge label mask.
 
     Steps
     -----
     1. Gaussian smoothing to suppress high-frequency shot noise.
-    2. Otsu's thresholding on the smoothed image -> binary cell footprint mask.
+    2. Otsu's thresholding on the smoothed image -> binary cell footprint
+       mask ("Global Cell Segmentation").
     3. Morphological erosion of the footprint -> boundary band mask that
-       hugs the cell membrane (footprint minus eroded-footprint).
-    4. Secondary high-intensity percentile threshold applied ONLY within the
-       boundary band -> binary edge mask of actin accumulation.
+       hugs the cell membrane ("Boundary Band Definition").
+    4. Secondary high-intensity percentile threshold applied ONLY within
+       the boundary band -> raw binary edge mask of actin accumulation
+       ("Targeted Intensity Thresholding" + "Binary Mask Extraction").
+    5. HOG-guided refinement: the raw edge mask from step 4 is re-weighted
+       by its Histogram-of-Oriented-Gradients response (utils/hog_processing.py)
+       and re-binarized. HOG orientation histograms are strong exactly at
+       sharp intensity transitions (i.e. true membrane edges), so this step
+       suppresses edge-mask pixels that survived the intensity threshold by
+       noise alone but have no real gradient structure behind them, and
+       keeps pixels that are both intensity-bright AND gradient-consistent
+       with a genuine boundary.
 
     Returns
     -------
     dict with keys:
-        'smoothed'     : Gaussian-smoothed image (float32, [0,1])
-        'footprint'    : binary cell mask from Otsu (uint8, {0,1})
-        'boundary_band': binary ring mask around the membrane (uint8, {0,1})
-        'edge_mask'    : final binary actin-edge label (uint8, {0,1})
+        'smoothed'          : Gaussian-smoothed image (float32, [0,1])
+        'footprint'         : binary cell mask from Otsu (uint8, {0,1})
+        'boundary_band'     : binary ring mask around the membrane (uint8, {0,1})
+        'edge_mask_raw'     : binary edge mask BEFORE HOG refinement (uint8, {0,1})
+        'hog_weight_map'    : soft HOG confidence map used for refinement (float32, [0,1])
+        'edge_mask'         : final binary actin-edge label AFTER HOG refinement (uint8, {0,1})
     """
     # --- 1. Gaussian smoothing -------------------------------------------------
     smoothed = cv2.GaussianBlur(
         img, config.GAUSSIAN_KERNEL_SIZE, sigmaX=config.GAUSSIAN_SIGMA
     )
 
-    # --- 2. Otsu's thresholding --------------------------------------------
+    # --- 2. Otsu's thresholding ("Global Cell Segmentation") ----------------
     # cv2.threshold expects uint8 input for Otsu; scale [0,1] -> [0,255]
     smoothed_u8 = (smoothed * 255).astype(np.uint8)
     otsu_val, footprint = cv2.threshold(
@@ -99,7 +114,7 @@ def preprocess_image(img: np.ndarray):
         )
     footprint = (footprint > 0).astype(np.uint8)
 
-    # --- 3. Morphological erosion -> boundary band --------------------------
+    # --- 3. Morphological erosion -> boundary band ("Boundary Band Definition") --
     boundary_band, eroded = compute_boundary_band_mask(
         footprint,
         structuring_element_size=config.STRUCTURING_ELEMENT_SIZE,
@@ -107,18 +122,31 @@ def preprocess_image(img: np.ndarray):
     )
 
     # --- 4. Secondary high-intensity threshold within the band ---------------
+    # ("Targeted Intensity Thresholding" + "Binary Mask Extraction")
     band_pixel_values = smoothed[boundary_band.astype(bool)]
     if band_pixel_values.size > 0:
         intensity_cutoff = np.percentile(band_pixel_values, config.EDGE_INTENSITY_PERCENTILE)
     else:
         intensity_cutoff = 1.0  # no band pixels -> empty edge mask
 
-    edge_mask = ((smoothed >= intensity_cutoff) & (boundary_band.astype(bool))).astype(np.uint8)
+    edge_mask_raw = ((smoothed >= intensity_cutoff) & (boundary_band.astype(bool))).astype(np.uint8)
+
+    # --- 5. HOG-guided refinement --------------------------------------------
+    if config.USE_HOG_REFINEMENT:
+        hog_weight_map = hog_guided_boundary_refinement(
+            smoothed, edge_mask_raw, hog_weight=config.HOG_REFINEMENT_WEIGHT
+        )
+        edge_mask = (hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD).astype(np.uint8)
+    else:
+        hog_weight_map = edge_mask_raw.astype(np.float32)
+        edge_mask = edge_mask_raw
 
     return {
         "smoothed": smoothed,
         "footprint": footprint,
         "boundary_band": boundary_band,
+        "edge_mask_raw": edge_mask_raw,
+        "hog_weight_map": hog_weight_map,
         "edge_mask": edge_mask,
     }
 
@@ -127,16 +155,15 @@ class ActinDataset(Dataset):
     """
     PyTorch Dataset that yields (image_tensor, mask_tensor) pairs.
 
-    Each raw .tif file in `config.RAW_IMAGE_DIR` is preprocessed on the fly
-    (Gaussian -> Otsu -> erosion -> intensity threshold). If a hand-labeled
-    mask with the same stem name exists in `config.MASK_DIR`, that mask is
-    used as ground truth instead of the auto-generated edge_mask, allowing
-    the pipeline to work with either weak or expert labels transparently.
+    Labeling method: every image is labeled automatically by the classical
+    pipeline in `preprocess_image()` -- Gaussian smoothing, Otsu thresholding,
+    morphological erosion (boundary band), targeted intensity thresholding,
+    and HOG-guided refinement. No manual annotation tool (Roboflow or
+    otherwise) is used; this dataset IS the labeling pipeline.
     """
 
-    def __init__(self, image_dir: str = None, mask_dir: str = None, image_size=None):
+    def __init__(self, image_dir: str = None, image_size=None):
         self.image_dir = image_dir or config.RAW_IMAGE_DIR
-        self.mask_dir = mask_dir or config.MASK_DIR
         self.image_size = image_size or config.IMAGE_SIZE
 
         self.image_paths = sorted(
@@ -152,28 +179,13 @@ class ActinDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
-    def _find_manual_mask(self, image_path: str):
-        """Looks for a hand-labeled mask matching the image's base filename."""
-        stem = os.path.splitext(os.path.basename(image_path))[0]
-        for ext in (".png", ".tif", ".tiff", ".jpg"):
-            candidate = os.path.join(self.mask_dir, stem + ext)
-            if os.path.exists(candidate):
-                return candidate
-        return None
-
     def __getitem__(self, idx: int):
         img_path = self.image_paths[idx]
         img = load_tif_image(img_path)
         img_resized = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
 
-        manual_mask_path = self._find_manual_mask(img_path)
-        if manual_mask_path is not None:
-            mask = cv2.imread(manual_mask_path, cv2.IMREAD_GRAYSCALE)
-            mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
-            mask = (mask > 127).astype(np.float32)
-        else:
-            processed = preprocess_image(img_resized)
-            mask = processed["edge_mask"].astype(np.float32)
+        processed = preprocess_image(img_resized)
+        mask = processed["edge_mask"].astype(np.float32)
 
         image_tensor = torch.from_numpy(img_resized).unsqueeze(0).float()   # (1, H, W)
         mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()           # (1, H, W)

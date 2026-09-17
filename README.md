@@ -1,28 +1,34 @@
-# Actin Segmentation Pipeline
+# Actin Segmentation Pipeline — 3-Model Benchmark
 
-A complete pipeline for segmenting and quantifying peripheral actin
-accumulation in fluorescence microscopy images, using classical image
-processing for weak-label generation plus a lightweight UNet++ (depthwise
-separable convolutions) for learned segmentation.
+A complete pipeline for labeling and segmenting peripheral actin
+accumulation in fluorescence microscopy images. **No manual annotation or
+Roboflow export is used** — labeling is done entirely by a classical
+computer-vision pipeline (Gaussian → Otsu → morphological erosion →
+intensity threshold → HOG-guided refinement). Three team members each
+train a distinct deep learning architecture with a distinct loss function
+against that same auto-generated label, for direct benchmarking.
 
 ## 1. Project Structure
 
 ```
 actin_segmentation_pipeline/
-├── config.py                    # all hyperparameters, thresholds, paths
-├── dataset.py                   # preprocessing + PyTorch Dataset/DataLoader
+├── config.py                     # all hyperparameters, thresholds, model registry
+├── dataset.py                    # labeling pipeline + PyTorch Dataset/DataLoader
+├── model_builder.py               # maps a model name -> architecture + loss function
 ├── models/
-│   └── unet_plus_plus.py        # lightweight UNet++ (depthwise separable convs)
+│   ├── unet_plus_plus.py          # Member A: Lightweight UNet++ (depthwise separable convs)
+│   ├── attention_unet.py          # Member B: Attention U-Net
+│   └── resunet_pp.py              # Member C: ResUNet++ (Residual + SE + ASPP)
 ├── utils/
-│   ├── hog_processing.py        # HOG features + boundary-band morphology
-│   └── metrics.py                # 4 biophysical metrics (PER, MCC, RAT, SPI)
-├── train.py                      # training loop, checkpointing, history CSV
-├── evaluate.py                   # inference, mask export, actin_metrics.csv
+│   ├── hog_processing.py          # HOG features + boundary-band morphology
+│   ├── losses.py                  # BCE+Dice, Tversky, Combo losses (one per member)
+│   └── metrics.py                 # 4 biophysical metrics (PER, MCC, RAT, SPI)
+├── train.py                       # training loop, --model flag, checkpointing
+├── evaluate.py                    # inference, mask export, per-model CSV, --all benchmark
 ├── data/
-│   ├── raw/                      # <-- put your .tif microscopy images here
-│   └── masks/                    # (optional) hand-labeled ground-truth masks
-├── checkpoints/                  # saved model weights (created automatically)
-├── outputs/                      # predicted masks, CSVs, training history
+│   └── raw/                       # <-- put your .tif microscopy images here
+├── checkpoints/                   # saved model weights, one file per model
+├── outputs/                       # predicted masks, CSVs, training history (per model)
 ├── requirements.txt
 └── README.md
 ```
@@ -43,72 +49,98 @@ Copy your microscopy images (`.tif` / `.tiff`) into:
 data/raw/
 ```
 
-If you have hand-labeled ground-truth masks, put them in `data/masks/` with
-the **same base filename** as their corresponding image (e.g.
-`cell_003.tif` -> `cell_003.png`). If no manual mask exists for an image,
-the pipeline automatically generates a weak label using the classical
-Gaussian -> Otsu -> erosion -> intensity-threshold chain described in
-`dataset.py`.
+**That's it — no annotation step required.** Every image is automatically
+labeled by `dataset.preprocess_image()`, which implements the exact
+pipeline your project brief specifies:
+
+1. **Global Cell Segmentation** — Gaussian smoothing, then Otsu's
+   thresholding, to get a binary footprint mask of the whole cell.
+2. **Boundary Band Definition** — morphological erosion of the footprint;
+   subtracting the eroded mask from the original yields a thin ring
+   strictly on the cell perimeter.
+3. **Targeted Intensity Thresholding** — a secondary, higher-intensity
+   percentile threshold applied only inside that boundary band isolates
+   the highly-accumulated actin regions.
+4. **Binary Mask Extraction** — binarize to produce the raw edge label.
+5. **HOG-Guided Refinement** — the raw edge label from step 4 is re-weighted
+   by its Histogram-of-Oriented-Gradients response (`utils/hog_processing.py`).
+   HOG's gradient-orientation histograms are strongest exactly at sharp
+   intensity transitions (true membrane edges), so pixels that passed the
+   intensity threshold by noise alone — but have no real gradient structure
+   behind them — are suppressed. Only pixels that are both intensity-bright
+   **and** gradient-consistent with a genuine boundary survive into the
+   final label.
+
+For your "Presentation of Labeled Data" slide, `preprocess_image()` returns
+every intermediate stage (`smoothed`, `footprint`, `boundary_band`,
+`edge_mask_raw`, `hog_weight_map`, `edge_mask`) so you can show the raw
+image next to each processing stage and the final label side by side.
 
 ## 4. Train
 
+Each team member trains their own model independently:
+
 ```bash
-python train.py
+python train.py --model unetpp            # Member A: BCE + Dice loss
+python train.py --model attention_unet    # Member B: Tversky loss
+python train.py --model resunetpp         # Member C: Combo loss
+
+# or train all three back to back:
+python train.py --all
 ```
 
-This will:
+This will, per model:
 - Split your data into train/validation sets (`config.VAL_SPLIT`)
-- Train the lightweight UNet++ with a combined BCE + Dice loss across all
-  deep-supervision output depths
-- Save the best checkpoint (highest validation Dice) to
-  `checkpoints/best_model.pth`
-- Log per-epoch loss/Dice to `outputs/training_history.csv`
+- Train with that model's registered loss function (see `config.MODEL_REGISTRY`)
+- Save the best checkpoint to `checkpoints/best_model_<name>.pth`
+- Log per-epoch loss/Dice to `outputs/training_history_<name>.csv`
 
-All hyperparameters (learning rate, batch size, epochs, loss weights, image
-size, etc.) can be changed in `config.py` without touching any other file.
+All hyperparameters (learning rate, batch size, epochs, per-loss weights,
+image size, HOG refinement strength, etc.) live in `config.py`.
 
-## 5. Evaluate
+## 5. Evaluate & Benchmark
 
 ```bash
-python evaluate.py
+python evaluate.py --model unetpp
+python evaluate.py --model attention_unet
+python evaluate.py --model resunetpp
+
+# or evaluate all three and print a side-by-side comparison table:
+python evaluate.py --all
 ```
 
-This will:
-- Load `checkpoints/best_model.pth`
-- Run inference on every image in `data/raw/`
-- Save predicted binary masks to `outputs/masks_pred/`
-- Write per-image biophysical metrics (Peripheral Enrichment Ratio,
-  Membrane Coverage Continuity, Radial Accumulation Thickness, Spatial
-  Polarity Index) plus segmentation quality metrics (Dice, F1, IoU),
-  inference time, and model parameter count to `outputs/actin_metrics.csv`
+Per model, this writes:
+- Predicted binary masks to `outputs/masks_pred_<name>/`
+- `outputs/actin_metrics_<name>.csv` with per-image biophysical metrics
+  (Peripheral Enrichment Ratio, Membrane Coverage Continuity, Radial
+  Accumulation Thickness, Spatial Polarity Index) plus Dice/F1/IoU against
+  the classical+HOG label, inference time, and parameter count.
 
-## 6. Key Design Notes
+`--all` additionally prints a mean-metric comparison table across all three
+architectures — the starting point for your box-plot benchmarking figure.
 
-- **Depthwise Separable Convolutions**: every conv block in the UNet++
-  uses a depthwise 3x3 conv followed by a pointwise 1x1 conv instead of a
-  standard 3x3 conv, cutting parameter count/FLOPs by roughly 8-9x versus a
-  standard-convolution UNet++ of the same width — this is what makes the
-  network "lightweight" enough to train quickly on modest hardware.
-- **UNet++ nested skip connections**: intermediate convolutional nodes
-  progressively bridge the semantic gap between encoder and decoder
-  features, which is especially useful for thin, boundary-hugging
-  structures like the actin edge band.
-- **Weak-label bootstrapping**: when no expert annotation exists, the
-  classical Gaussian/Otsu/erosion/intensity-threshold chain in
-  `dataset.py` supplies an automatically generated label so the model can
-  still be trained; this is standard practice in bio-image pipelines with
-  limited manual annotation budgets.
-- **HOG-guided boundary refinement**: `utils/hog_processing.py` provides
-  an optional soft-weighting step that uses HOG gradient-orientation
-  strength to down-weight likely-spurious boundary-band pixels before they
-  become training labels.
+## 6. The Three Models
+
+| | Network | Loss Function | Reference Paper |
+|---|---|---|---|
+| **Member A** | Lightweight UNet++ (depthwise separable convs, ~287K params) | Combined BCE + Dice | Zhou et al., DLMIA 2018 |
+| **Member B** | Attention U-Net (attention-gated skip connections) | Tversky Loss | Oktay et al., arXiv 2018 / Salehi et al., MLMI 2017 |
+| **Member C** | ResUNet++ (Residual blocks + Squeeze-Excitation + ASPP) | Combo Loss (weighted-BCE + Dice) | Jha et al., IEEE ISM 2019 |
+
+Each network uses a genuinely different core mechanism (nested skip depth
+vs. spatial attention gating vs. channel-wise recalibration + multi-scale
+atrous context), and each loss handles the foreground/background imbalance
+of thin actin-edge masks differently — see the docstrings in
+`utils/losses.py` and each file under `models/` for the full math and
+reasoning behind each choice.
 
 ## 7. Extending the Pipeline
 
-- Swap in your own labeling tool's masks by dropping PNGs into
-  `data/masks/` — no code changes required.
+- Tune the classical labeling stage (thresholds, band width, HOG weighting)
+  entirely from `config.py` without touching any other file.
+- Add a fourth architecture by writing a new file under `models/` with a
+  `forward(x) -> logits` (or list of logits, for deep supervision)
+  interface, then registering it in `config.MODEL_REGISTRY` and
+  `model_builder.build_model()`.
 - Add new biophysical metrics by writing a new function in
   `utils/metrics.py` and adding it to `compute_all_metrics()`.
-- To benchmark against other architectures, add a new file under
-  `models/` following the same `forward(x) -> logits` interface used by
-  `LightUNetPlusPlus`, then swap the import in `train.py`/`evaluate.py`.

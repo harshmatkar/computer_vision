@@ -17,13 +17,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RAW_IMAGE_DIR = os.path.join(DATA_DIR, "raw")        # input .tif microscopy images
-MASK_DIR = os.path.join(DATA_DIR, "masks")           # ground-truth / generated masks
+# NOTE: no manual/Roboflow mask directory -- labels are generated entirely by
+# the classical pipeline in dataset.py (Gaussian -> Otsu -> erosion -> threshold
+# -> HOG refinement). See dataset.preprocess_image().
 
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 METRICS_CSV_PATH = os.path.join(OUTPUT_DIR, "actin_metrics.csv")
 
-for _d in (RAW_IMAGE_DIR, MASK_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
+for _d in (RAW_IMAGE_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -48,6 +50,22 @@ STRUCTURING_ELEMENT_SIZE = 3     # size of the disk/square structuring element
 EDGE_INTENSITY_PERCENTILE = 85   # percentile-based threshold inside the band
 
 # ---------------------------------------------------------------------------
+# HOG-GUIDED LABEL REFINEMENT (Step 5 of the labeling pipeline)
+# ---------------------------------------------------------------------------
+# After the classical Otsu/erosion/intensity-threshold chain produces a raw
+# edge mask, that mask is refined using the HOG gradient-orientation response
+# (see utils/hog_processing.hog_guided_boundary_refinement): pixels that are
+# intensity-bright but have no real gradient structure behind them (i.e.
+# likely noise) are down-weighted before the final re-binarization.
+USE_HOG_REFINEMENT = True
+HOG_REFINEMENT_WEIGHT = 0.75      # 0 = ignore HOG, 1 = fully weight by HOG response
+                                   # (kept > 0.5 so HOG can actually veto a pixel:
+                                   #  floor value for any raw-band pixel is 1-weight,
+                                   #  so weight must exceed the threshold below for
+                                   #  HOG to have zero effect)
+HOG_REFINEMENT_THRESHOLD = 0.5    # cutoff on the HOG-weighted confidence map
+
+# ---------------------------------------------------------------------------
 # HOG FEATURE EXTRACTION PARAMETERS
 # ---------------------------------------------------------------------------
 HOG_ORIENTATIONS = 9
@@ -63,6 +81,39 @@ OUT_CHANNELS = 1                 # binary segmentation (actin edge vs background
 BASE_FILTERS = 16                # width of first UNet++ stage (kept small -> "lightweight")
 DEPTH = 4                        # number of down-sampling stages
 USE_DEEP_SUPERVISION = True      # UNet++ style deep supervision on all decoder stages
+
+# Registry of the three team members' models. Each entry names the model,
+# its loss function, and the checkpoint/output filenames it should use, so
+# train.py / evaluate.py can be pointed at any one of them via --model.
+MODEL_REGISTRY = {
+    "unetpp": {
+        "display_name": "Lightweight UNet++ (Depthwise Separable Convs)",
+        "loss": "bce_dice",
+        "checkpoint_name": "best_model_unetpp.pth",
+        "metrics_csv_name": "actin_metrics_unetpp.csv",
+    },
+    "attention_unet": {
+        "display_name": "Attention U-Net",
+        "loss": "tversky",
+        "checkpoint_name": "best_model_attention_unet.pth",
+        "metrics_csv_name": "actin_metrics_attention_unet.csv",
+    },
+    "resunetpp": {
+        "display_name": "ResUNet++ (Residual + SE + ASPP)",
+        "loss": "combo",
+        "checkpoint_name": "best_model_resunetpp.pth",
+        "metrics_csv_name": "actin_metrics_resunetpp.csv",
+    },
+}
+DEFAULT_MODEL = "unetpp"
+
+# Tversky loss hyperparameters (Member B, Attention U-Net)
+TVERSKY_ALPHA = 0.7   # weight on false positives
+TVERSKY_BETA = 0.3    # weight on false negatives
+
+# Combo loss hyperparameters (Member C, ResUNet++)
+COMBO_ALPHA = 0.5     # balance between weighted-CE and Dice terms
+COMBO_CE_BETA = 0.5   # weight applied to the positive (foreground) class in weighted-CE
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS
