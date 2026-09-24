@@ -2,25 +2,34 @@
 config.py
 ---------
 Central configuration for the Actin Segmentation Pipeline.
-All hyperparameters, thresholds, and file paths are defined here so that
-every other module (dataset.py, train.py, evaluate.py, utils/*) can import
-a single source of truth instead of hard-coding values.
+
+Pipeline summary (v4 - Frangi ridge detection):
+    The classical labeling pipeline uses a Frangi vesselness filter to
+    directly detect bright curvilinear actin structures (junctions/filaments)
+    in confluent monolayer images, instead of the Otsu+erosion+boundary-band
+    approach which assumed a single isolated cell.
+
+    Why Frangi?
+    -----------
+    The Frangi filter computes eigenvalues of the Hessian matrix at multiple
+    scales. At ridge-like structures (bright curvilinear lines on a darker
+    background -- exactly what actin junctions look like), one eigenvalue is
+    large and negative, the other near zero. The vesselness score combines
+    these into a strong response at actin junctions and near-zero response
+    everywhere else. No assumption about cell shape, cell count, or background
+    separation is needed -- it works directly on the intensity structure of
+    the filaments themselves.
 """
 
 import os
-import torch
+import tensorflow as tf
 
 # ---------------------------------------------------------------------------
 # PATHS
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 DATA_DIR = os.path.join(BASE_DIR, "data")
-RAW_IMAGE_DIR = os.path.join(DATA_DIR, "raw")        # input .tif microscopy images
-# NOTE: no manual/Roboflow mask directory -- labels are generated entirely by
-# the classical pipeline in dataset.py (Gaussian -> Otsu -> erosion -> threshold
-# -> HOG refinement). See dataset.preprocess_image().
-
+RAW_IMAGE_DIR = os.path.join(DATA_DIR, "raw")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 METRICS_CSV_PATH = os.path.join(OUTPUT_DIR, "actin_metrics.csv")
@@ -29,110 +38,109 @@ for _d in (RAW_IMAGE_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# IMAGE PREPROCESSING PARAMETERS
+# IMAGE PREPROCESSING
 # ---------------------------------------------------------------------------
-IMAGE_SIZE = (256, 256)          # (H, W) — all images/masks are resized to this
-GAUSSIAN_KERNEL_SIZE = (5, 5)    # kernel used for de-noising blur
+IMAGE_SIZE = (256, 256)
+GAUSSIAN_KERNEL_SIZE = (3, 3)
 GAUSSIAN_SIGMA = 1.0
 
-# Otsu thresholding is parameter-free (computed automatically from histogram),
-# but we keep a manual override / floor for edge cases with very low SNR.
-OTSU_MANUAL_FLOOR = 0            # 0 disables manual floor, uses pure Otsu value
+# ---------------------------------------------------------------------------
+# FRANGI VESSELNESS FILTER PARAMETERS
+# ---------------------------------------------------------------------------
+# sigmas: range of scales (in pixels) at which to detect actin ridges.
+#   Actin junctions in fluorescence microscopy are typically 1-5px wide
+#   at 256x256 resolution. Using multiple sigmas makes detection robust
+#   to varying filament widths across images.
+FRANGI_SIGMAS = (1, 2, 3, 4, 5)
 
-# Morphological erosion used to build the "boundary band" that hugs the
-# cell membrane. BAND_WIDTH_PX controls how many pixels wide that band is.
-BAND_WIDTH_PX = 6
-EROSION_ITERATIONS = 1
-STRUCTURING_ELEMENT_SIZE = 3     # size of the disk/square structuring element
+# black_ridges=False: we want BRIGHT ridges (actin) on a DARKER background.
+#   Set True only if you invert your images before processing.
+FRANGI_BLACK_RIDGES = False
 
-# Secondary high-intensity threshold (0-255 or 0-1 depending on normalization)
-# applied ONLY inside the boundary band to isolate actin accumulation.
-EDGE_INTENSITY_PERCENTILE = 85   # percentile-based threshold inside the band
+# alpha, beta: Frangi filter shape parameters controlling sensitivity to
+#   blob-vs-ridge and background noise respectively.
+FRANGI_ALPHA = 0.5
+FRANGI_BETA = 0.5
+
+# Threshold percentile applied to the Frangi response map to binarize it.
+#   Higher = only the strongest actin ridges labeled (fewer, cleaner pixels).
+#   Lower  = more actin pixels captured (noisier).
+#   Start at 94 -- the Frangi response is heavily skewed so only the top
+#   few percent of pixels are genuine ridges.
+FRANGI_THRESHOLD_PERCENTILE = 94
+
+# Optional: after binarizing, remove isolated specks smaller than this
+#   area (in pixels) to suppress noise. 0 disables this step.
+FRANGI_MIN_COMPONENT_AREA = 10
 
 # ---------------------------------------------------------------------------
-# HOG-GUIDED LABEL REFINEMENT (Step 5 of the labeling pipeline)
+# HOG-GUIDED REFINEMENT (applied after Frangi binarization)
 # ---------------------------------------------------------------------------
-# After the classical Otsu/erosion/intensity-threshold chain produces a raw
-# edge mask, that mask is refined using the HOG gradient-orientation response
-# (see utils/hog_processing.hog_guided_boundary_refinement): pixels that are
-# intensity-bright but have no real gradient structure behind them (i.e.
-# likely noise) are down-weighted before the final re-binarization.
 USE_HOG_REFINEMENT = True
-HOG_REFINEMENT_WEIGHT = 0.75      # 0 = ignore HOG, 1 = fully weight by HOG response
-                                   # (kept > 0.5 so HOG can actually veto a pixel:
-                                   #  floor value for any raw-band pixel is 1-weight,
-                                   #  so weight must exceed the threshold below for
-                                   #  HOG to have zero effect)
-HOG_REFINEMENT_THRESHOLD = 0.5    # cutoff on the HOG-weighted confidence map
+HOG_REFINEMENT_WEIGHT = 0.6
+HOG_REFINEMENT_THRESHOLD = 0.35
 
-# ---------------------------------------------------------------------------
-# HOG FEATURE EXTRACTION PARAMETERS
-# ---------------------------------------------------------------------------
 HOG_ORIENTATIONS = 9
 HOG_PIXELS_PER_CELL = (8, 8)
 HOG_CELLS_PER_BLOCK = (2, 2)
 HOG_BLOCK_NORM = "L2-Hys"
 
 # ---------------------------------------------------------------------------
-# MODEL / ARCHITECTURE HYPERPARAMETERS
+# BIOPHYSICAL METRIC PARAMETERS
 # ---------------------------------------------------------------------------
-IN_CHANNELS = 1                  # grayscale fluorescence microscopy
-OUT_CHANNELS = 1                 # binary segmentation (actin edge vs background)
-BASE_FILTERS = 16                # width of first UNet++ stage (kept small -> "lightweight")
-DEPTH = 4                        # number of down-sampling stages
-USE_DEEP_SUPERVISION = True      # UNet++ style deep supervision on all decoder stages
+# For Frangi-based labeling the "footprint" concept changes: we use a
+# dilated version of the actin mask itself as the "cell region" for
+# biophysical metrics, since there is no separate cell-body segmentation.
+BAND_WIDTH_PX = 6
+POLARITY_NUM_SECTORS = 16
 
-# Registry of the three team members' models. Each entry names the model,
-# its loss function, and the checkpoint/output filenames it should use, so
-# train.py / evaluate.py can be pointed at any one of them via --model.
+# ---------------------------------------------------------------------------
+# MODEL HYPERPARAMETERS
+# ---------------------------------------------------------------------------
+IN_CHANNELS = 1
+OUT_CHANNELS = 1
+BASE_FILTERS = 16
+DEPTH = 4
+USE_DEEP_SUPERVISION = True
+
 MODEL_REGISTRY = {
     "unetpp": {
         "display_name": "Lightweight UNet++ (Depthwise Separable Convs)",
         "loss": "bce_dice",
-        "checkpoint_name": "best_model_unetpp.pth",
+        "checkpoint_name": "best_model_unetpp.keras",
         "metrics_csv_name": "actin_metrics_unetpp.csv",
     },
     "attention_unet": {
         "display_name": "Attention U-Net",
         "loss": "tversky",
-        "checkpoint_name": "best_model_attention_unet.pth",
+        "checkpoint_name": "best_model_attention_unet.keras",
         "metrics_csv_name": "actin_metrics_attention_unet.csv",
     },
     "resunetpp": {
         "display_name": "ResUNet++ (Residual + SE + ASPP)",
         "loss": "combo",
-        "checkpoint_name": "best_model_resunetpp.pth",
+        "checkpoint_name": "best_model_resunetpp.keras",
         "metrics_csv_name": "actin_metrics_resunetpp.csv",
     },
 }
 DEFAULT_MODEL = "unetpp"
 
-# Tversky loss hyperparameters (Member B, Attention U-Net)
-TVERSKY_ALPHA = 0.7   # weight on false positives
-TVERSKY_BETA = 0.3    # weight on false negatives
-
-# Combo loss hyperparameters (Member C, ResUNet++)
-COMBO_ALPHA = 0.5     # balance between weighted-CE and Dice terms
-COMBO_CE_BETA = 0.5   # weight applied to the positive (foreground) class in weighted-CE
+TVERSKY_ALPHA = 0.7
+TVERSKY_BETA  = 0.3
+COMBO_ALPHA   = 0.5
+COMBO_CE_BETA = 0.5
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS
 # ---------------------------------------------------------------------------
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 8
+GPU_AVAILABLE = len(tf.config.list_physical_devices("GPU")) > 0
+BATCH_SIZE = 2
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-5
-VAL_SPLIT = 0.2
-RANDOM_SEED = 42
+WEIGHT_DECAY  = 1e-5
+VAL_SPLIT     = 0.2
+RANDOM_SEED   = 42
 EARLY_STOP_PATIENCE = 10
-
-# Loss weighting: total_loss = BCE_WEIGHT * BCEWithLogits + DICE_WEIGHT * (1 - Dice)
-BCE_WEIGHT = 0.5
-DICE_WEIGHT = 0.5
-
-# ---------------------------------------------------------------------------
-# EVALUATION / BIOPHYSICAL METRIC PARAMETERS
-# ---------------------------------------------------------------------------
-SEGMENTATION_PROB_THRESHOLD = 0.5   # sigmoid output -> binary mask cutoff
-POLARITY_NUM_SECTORS = 16           # angular sectors used for Spatial Polarity Index
+BCE_WEIGHT    = 0.5
+DICE_WEIGHT   = 0.5
+SEGMENTATION_PROB_THRESHOLD = 0.5

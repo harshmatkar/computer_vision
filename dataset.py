@@ -2,217 +2,346 @@
 dataset.py
 ----------
 Handles:
-  1. Loading raw .tif fluorescence microscopy images.
-  2. Preprocessing pipeline: Gaussian smoothing -> Otsu thresholding ->
-     morphological erosion (boundary band) -> secondary intensity threshold
-     to obtain the weak/auto-generated actin-edge label mask.
-  3. Wrapping everything into a PyTorch Dataset + DataLoader.
+    1. Loading raw .tif fluorescence microscopy images.
+    2. Classical labeling pipeline (v4 - Frangi ridge detection):
+         Gaussian smoothing
+         -> Frangi vesselness filter  (detects bright curvilinear actin)
+         -> Percentile threshold      (binarize Frangi response)
+         -> Small-component removal   (suppress speckle noise)
+         -> HOG-guided refinement     (remove non-edge noise pixels)
+    3. Creating tf.data.Dataset pipelines for training.
 
-If a matching hand-labeled mask already exists in `config.MASK_DIR`, it is
-used as ground truth. Otherwise, the auto-generated boundary-band mask
-(from Step 1 of the pipeline) is used as a weak label, which is common
-practice in bio-image segmentation when manual annotation is scarce.
+Why Frangi instead of Otsu + erosion:
+    The previous Otsu-based pipeline assumed one isolated cell with actin
+    only on its outer boundary. Real images are confluent monolayers where
+    actin accumulates at cell-cell junctions throughout the entire field.
+    The Frangi vesselness filter directly detects bright curvilinear
+    ridge-like structures (actin filaments / junctions) without assuming
+    anything about cell shape, cell count, or background separation.
 """
 
 import os
 import glob
+
 import numpy as np
 import cv2
-import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+import tensorflow as tf
+from PIL import Image
+from skimage.filters import frangi
+from skimage.morphology import remove_small_objects
 
 import config
-from utils.hog_processing import compute_boundary_band_mask, hog_guided_boundary_refinement
+from utils.hog_processing import extract_hog_features
 
+
+# ============================================================
+# 1. LOAD IMAGE
+# ============================================================
 
 def load_tif_image(path: str) -> np.ndarray:
     """
-    Loads a .tif (or any OpenCV-readable) microscopy image as a single-channel
-    float32 array normalized to [0, 1].
+    Load a TIFF fluorescence image and normalize it to [0, 1].
 
-    Parameters
-    ----------
-    path : str
-        Full path to the image file.
+    Uses PIL so that 16-bit TIFFs are read correctly (OpenCV
+    imread with IMREAD_UNCHANGED also works but PIL handles
+    multi-page TIFFs and unusual colour modes more gracefully).
 
     Returns
     -------
     np.ndarray
-        2D float32 array, shape (H, W), values in [0, 1].
+        2D float32 array, values in [0, 1].
     """
-    # IMREAD_UNCHANGED preserves 16-bit depth common in scientific TIFFs
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image at: {path}")
+    with Image.open(path) as img:
+        arr = np.array(img, dtype=np.float32)
 
-    # Collapse to single channel if the TIFF has multiple channels/stacks
-    if img.ndim == 3:
-        img = img[..., 0]
+    # Collapse to single channel if multi-channel / RGB
+    if arr.ndim == 3:
+        arr = arr[..., 0]
 
-    img = img.astype(np.float32)
-    # Normalize using min-max scaling (robust to 8-bit or 16-bit source depth)
-    img_min, img_max = img.min(), img.max()
-    if img_max > img_min:
-        img = (img - img_min) / (img_max - img_min)
+    lo, hi = arr.min(), arr.max()
+    if hi > lo:
+        arr = (arr - lo) / (hi - lo)
     else:
-        img = np.zeros_like(img)
+        arr = np.zeros_like(arr)
 
-    return img
+    return arr.astype(np.float32)
 
 
-def preprocess_image(img: np.ndarray):
+# ============================================================
+# 2. FRANGI-BASED LABELING PIPELINE
+# ============================================================
+
+def preprocess_image(img: np.ndarray) -> dict:
     """
-    Runs the full classical labeling pipeline on a single normalized image.
-    This IS the labeling method for this project (no manual/Roboflow
-    annotation is used) -- it deterministically converts a raw intensity
-    image into a binary actin-edge label mask.
+    Generate a binary actin-edge label from one normalized image
+    using a Frangi vesselness filter instead of the Otsu+erosion
+    approach that assumed a single isolated cell.
 
     Steps
     -----
-    1. Gaussian smoothing to suppress high-frequency shot noise.
-    2. Otsu's thresholding on the smoothed image -> binary cell footprint
-       mask ("Global Cell Segmentation").
-    3. Morphological erosion of the footprint -> boundary band mask that
-       hugs the cell membrane ("Boundary Band Definition").
-    4. Secondary high-intensity percentile threshold applied ONLY within
-       the boundary band -> raw binary edge mask of actin accumulation
-       ("Targeted Intensity Thresholding" + "Binary Mask Extraction").
-    5. HOG-guided refinement: the raw edge mask from step 4 is re-weighted
-       by its Histogram-of-Oriented-Gradients response (utils/hog_processing.py)
-       and re-binarized. HOG orientation histograms are strong exactly at
-       sharp intensity transitions (i.e. true membrane edges), so this step
-       suppresses edge-mask pixels that survived the intensity threshold by
-       noise alone but have no real gradient structure behind them, and
-       keeps pixels that are both intensity-bright AND gradient-consistent
-       with a genuine boundary.
+    1. Gaussian smoothing  -- suppress high-frequency shot noise
+       so the Hessian matrix used by the Frangi filter sees clean
+       intensity ridges rather than noise spikes.
+    2. Frangi vesselness filter  -- computes the Hessian eigenvalues
+       at multiple scales (config.FRANGI_SIGMAS). At ridge-like
+       structures (actin junctions), one eigenvalue is large and
+       negative while the other is near zero; the vesselness score
+       combines these into a strong, scale-normalised response at
+       the filaments and near-zero everywhere else.
+    3. Percentile threshold  -- binarize the Frangi response map.
+       Only the top (100 - FRANGI_THRESHOLD_PERCENTILE)% of pixels
+       pass; because the Frangi response is extremely right-skewed,
+       this naturally selects genuine actin ridges.
+    4. Small-component removal  -- drop binary blobs smaller than
+       FRANGI_MIN_COMPONENT_AREA pixels to suppress isolated speckle
+       noise that still passed the threshold.
+    5. HOG-guided refinement  (if config.USE_HOG_REFINEMENT)  --
+       re-weight each candidate actin pixel by the HOG gradient-
+       orientation response at that location. HOG responds strongly
+       at oriented intensity edges (true membrane ridges) and weakly
+       at isotropic bright spots (out-of-focus fluorescence, dust).
+       Pixels that are bright in Frangi but lack directional gradient
+       structure are suppressed.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Normalized float32 image, values in [0, 1], shape (H, W).
 
     Returns
     -------
     dict with keys:
-        'smoothed'          : Gaussian-smoothed image (float32, [0,1])
-        'footprint'         : binary cell mask from Otsu (uint8, {0,1})
-        'boundary_band'     : binary ring mask around the membrane (uint8, {0,1})
-        'edge_mask_raw'     : binary edge mask BEFORE HOG refinement (uint8, {0,1})
-        'hog_weight_map'    : soft HOG confidence map used for refinement (float32, [0,1])
-        'edge_mask'         : final binary actin-edge label AFTER HOG refinement (uint8, {0,1})
+        smoothed          -- Gaussian-denoised image
+        frangi_map        -- raw float32 Frangi vesselness response
+        frangi_binary     -- binarized Frangi map (before HOG)
+        hog_weight_map    -- HOG soft-weight map (or copy of frangi_binary)
+        edge_mask         -- final binary actin label used for training
+        footprint         -- dilated actin mask used as "cell region"
+                             proxy for biophysical metrics
     """
-    # --- 1. Gaussian smoothing -------------------------------------------------
+
+    # ----------------------------------------------------------
+    # Step 1: Gaussian smoothing
+    # ----------------------------------------------------------
     smoothed = cv2.GaussianBlur(
-        img, config.GAUSSIAN_KERNEL_SIZE, sigmaX=config.GAUSSIAN_SIGMA
+        img,
+        config.GAUSSIAN_KERNEL_SIZE,
+        sigmaX=config.GAUSSIAN_SIGMA,
     )
 
-    # --- 2. Otsu's thresholding ("Global Cell Segmentation") ----------------
-    # cv2.threshold expects uint8 input for Otsu; scale [0,1] -> [0,255]
-    smoothed_u8 = (smoothed * 255).astype(np.uint8)
-    otsu_val, footprint = cv2.threshold(
-        smoothed_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    if config.OTSU_MANUAL_FLOOR > 0:
-        # Optional manual floor override for very low-SNR images
-        _, footprint = cv2.threshold(
-            smoothed_u8, max(otsu_val, config.OTSU_MANUAL_FLOOR), 255, cv2.THRESH_BINARY
+    # ----------------------------------------------------------
+    # Step 2: Frangi vesselness filter
+    #
+    # skimage.filters.frangi expects float image in [0, 1].
+    # black_ridges=False -> detect BRIGHT ridges on dark bg.
+    # Returns a float map in [0, 1]: high where the image looks
+    # like a bright curvilinear tube/sheet, near 0 elsewhere.
+    # ----------------------------------------------------------
+    frangi_map = frangi(
+        smoothed,
+        sigmas=config.FRANGI_SIGMAS,
+        alpha=config.FRANGI_ALPHA,
+        beta=config.FRANGI_BETA,
+        black_ridges=config.FRANGI_BLACK_RIDGES,
+    ).astype(np.float32)
+
+    # ----------------------------------------------------------
+    # Step 3: Percentile threshold
+    # ----------------------------------------------------------
+    nonzero_vals = frangi_map[frangi_map > 0]
+    if nonzero_vals.size > 0:
+        threshold = np.percentile(
+            nonzero_vals, config.FRANGI_THRESHOLD_PERCENTILE
         )
-    footprint = (footprint > 0).astype(np.uint8)
-
-    # --- 3. Morphological erosion -> boundary band ("Boundary Band Definition") --
-    boundary_band, eroded = compute_boundary_band_mask(
-        footprint,
-        structuring_element_size=config.STRUCTURING_ELEMENT_SIZE,
-        iterations=config.EROSION_ITERATIONS,
-    )
-
-    # --- 4. Secondary high-intensity threshold within the band ---------------
-    # ("Targeted Intensity Thresholding" + "Binary Mask Extraction")
-    band_pixel_values = smoothed[boundary_band.astype(bool)]
-    if band_pixel_values.size > 0:
-        intensity_cutoff = np.percentile(band_pixel_values, config.EDGE_INTENSITY_PERCENTILE)
     else:
-        intensity_cutoff = 1.0  # no band pixels -> empty edge mask
+        threshold = 1.0  # nothing detected -> empty mask
 
-    edge_mask_raw = ((smoothed >= intensity_cutoff) & (boundary_band.astype(bool))).astype(np.uint8)
+    frangi_binary = (frangi_map >= threshold).astype(np.uint8)
 
-    # --- 5. HOG-guided refinement --------------------------------------------
-    if config.USE_HOG_REFINEMENT:
-        hog_weight_map = hog_guided_boundary_refinement(
-            smoothed, edge_mask_raw, hog_weight=config.HOG_REFINEMENT_WEIGHT
+    # ----------------------------------------------------------
+    # Step 4: Remove small components (noise suppression)
+    # ----------------------------------------------------------
+    if config.FRANGI_MIN_COMPONENT_AREA > 0 and frangi_binary.sum() > 0:
+        cleaned = remove_small_objects(
+            frangi_binary.astype(bool),
+            max_size=config.FRANGI_MIN_COMPONENT_AREA,
         )
-        edge_mask = (hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD).astype(np.uint8)
+        frangi_binary = cleaned.astype(np.uint8)
+
+    # ----------------------------------------------------------
+    # Step 5: HOG-guided refinement
+    # ----------------------------------------------------------
+    if config.USE_HOG_REFINEMENT and frangi_binary.sum() > 0:
+        _, hog_vis = extract_hog_features(smoothed, visualize=True)
+
+        if hog_vis.shape != smoothed.shape:
+            hog_vis = cv2.resize(
+                hog_vis, (smoothed.shape[1], smoothed.shape[0])
+            )
+
+        # Soft-weight: blend HOG orientation response with the
+        # raw binary mask so gradient-consistent pixels score
+        # higher than isotropic bright spots.
+        w = config.HOG_REFINEMENT_WEIGHT
+        hog_weight_map = (
+            frangi_binary.astype(np.float32)
+            * ((1 - w) + w * hog_vis.astype(np.float32))
+        ).astype(np.float32)
+        hog_weight_map = np.clip(hog_weight_map, 0, 1)
+
+        edge_mask = (
+            (hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD)
+            & (frangi_binary > 0)
+        ).astype(np.uint8)
     else:
-        hog_weight_map = edge_mask_raw.astype(np.float32)
-        edge_mask = edge_mask_raw
+        hog_weight_map = frangi_binary.astype(np.float32)
+        edge_mask = frangi_binary.copy()
+
+    # ----------------------------------------------------------
+    # Footprint: dilate actin mask to approximate the "cell
+    # region" for biophysical metrics (PER, MCC, RAT, SPI).
+    # Since there is no separate cell-body segmentation in the
+    # Frangi pipeline, we use a thick dilation of the actin mask
+    # as a stand-in for "region near the membrane."
+    # ----------------------------------------------------------
+    dil_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (config.BAND_WIDTH_PX * 4 + 1, config.BAND_WIDTH_PX * 4 + 1),
+    )
+    footprint = cv2.dilate(
+        edge_mask, dil_kernel, iterations=1
+    ).astype(np.uint8)
 
     return {
-        "smoothed": smoothed,
-        "footprint": footprint,
-        "boundary_band": boundary_band,
-        "edge_mask_raw": edge_mask_raw,
+        "smoothed":      smoothed,
+        "frangi_map":    frangi_map,
+        "frangi_binary": frangi_binary,
         "hog_weight_map": hog_weight_map,
-        "edge_mask": edge_mask,
+        "edge_mask":     edge_mask,
+        "footprint":     footprint,
     }
 
 
-class ActinDataset(Dataset):
+# ============================================================
+# 3. NUMPY LOADER (called inside tf.py_function)
+# ============================================================
+
+def _load_and_label_numpy(path_bytes):
     """
-    PyTorch Dataset that yields (image_tensor, mask_tensor) pairs.
-
-    Labeling method: every image is labeled automatically by the classical
-    pipeline in `preprocess_image()` -- Gaussian smoothing, Otsu thresholding,
-    morphological erosion (boundary band), targeted intensity thresholding,
-    and HOG-guided refinement. No manual annotation tool (Roboflow or
-    otherwise) is used; this dataset IS the labeling pipeline.
+    Load one .tif image, run the Frangi labeling pipeline,
+    return (image, mask) as (H,W,1) float32 arrays.
     """
+    path = path_bytes.numpy().decode("utf-8")
+    img = load_tif_image(path)
 
-    def __init__(self, image_dir: str = None, image_size=None):
-        self.image_dir = image_dir or config.RAW_IMAGE_DIR
-        self.image_size = image_size or config.IMAGE_SIZE
+    img_resized = cv2.resize(
+        img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
+    )
 
-        self.image_paths = sorted(
-            glob.glob(os.path.join(self.image_dir, "*.tif"))
-            + glob.glob(os.path.join(self.image_dir, "*.tiff"))
+    processed = preprocess_image(img_resized)
+    mask = processed["edge_mask"].astype(np.float32)
+
+    image_arr = img_resized[..., np.newaxis].astype(np.float32)  # (H,W,1)
+    mask_arr  = mask[..., np.newaxis].astype(np.float32)          # (H,W,1)
+    return image_arr, mask_arr
+
+
+# ============================================================
+# 4. TF.DATA WRAPPERS
+# ============================================================
+
+def _tf_load_and_label(path_tensor):
+    image, mask = tf.py_function(
+        func=_load_and_label_numpy,
+        inp=[path_tensor],
+        Tout=(tf.float32, tf.float32),
+    )
+    h, w = config.IMAGE_SIZE
+    image.set_shape((h, w, 1))
+    mask.set_shape((h, w, 1))
+    return image, mask
+
+
+def _load_image_only_numpy(path_bytes):
+    path = path_bytes.numpy().decode("utf-8")
+    img = load_tif_image(path)
+    img_resized = cv2.resize(
+        img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
+    )
+    return img_resized[..., np.newaxis].astype(np.float32)
+
+
+def _tf_load_image_only(path_tensor):
+    image = tf.py_function(
+        func=_load_image_only_numpy,
+        inp=[path_tensor],
+        Tout=tf.float32,
+    )
+    h, w = config.IMAGE_SIZE
+    image.set_shape((h, w, 1))
+    return image
+
+
+# ============================================================
+# 5. HELPERS
+# ============================================================
+
+def get_image_paths(image_dir=None):
+    image_dir = config.RAW_IMAGE_DIR if image_dir is None else image_dir
+    paths = sorted(
+        glob.glob(os.path.join(image_dir, "*.tif"))
+        + glob.glob(os.path.join(image_dir, "*.tiff"))
+    )
+    if len(paths) == 0:
+        raise RuntimeError(
+            f"No .tif/.tiff images found in {image_dir}. "
+            f"Place your microscopy images there before training."
         )
-        if len(self.image_paths) == 0:
-            raise RuntimeError(
-                f"No .tif/.tiff images found in {self.image_dir}. "
-                f"Place your microscopy images there before training."
-            )
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx: int):
-        img_path = self.image_paths[idx]
-        img = load_tif_image(img_path)
-        img_resized = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
-
-        processed = preprocess_image(img_resized)
-        mask = processed["edge_mask"].astype(np.float32)
-
-        image_tensor = torch.from_numpy(img_resized).unsqueeze(0).float()   # (1, H, W)
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()           # (1, H, W)
-
-        return image_tensor, mask_tensor, os.path.basename(img_path)
+    return paths
 
 
-def get_dataloaders(batch_size: int = None, val_split: float = None, seed: int = None):
+# ============================================================
+# 6. TRAIN / VALIDATION DATASETS
+# ============================================================
+
+def get_datasets(batch_size=None, val_split=None, seed=None):
     """
-    Builds train/validation DataLoaders with a reproducible random split.
-
-    Returns
-    -------
-    (train_loader, val_loader) : tuple of torch.utils.data.DataLoader
+    Returns (train_ds, val_ds, n_train, n_val).
+    Each dataset yields (image, mask) batches, float32, (B,H,W,1).
     """
-    batch_size = batch_size or config.BATCH_SIZE
-    val_split = val_split if val_split is not None else config.VAL_SPLIT
-    seed = seed or config.RANDOM_SEED
+    batch_size = config.BATCH_SIZE   if batch_size is None else batch_size
+    val_split  = config.VAL_SPLIT    if val_split  is None else val_split
+    seed       = config.RANDOM_SEED  if seed       is None else seed
 
-    dataset = ActinDataset()
-    n_val = max(1, int(len(dataset) * val_split))
-    n_train = len(dataset) - n_val
+    paths   = get_image_paths()
+    n_total = len(paths)
+    if n_total < 2:
+        raise RuntimeError("At least 2 images required for train/val split.")
 
-    generator = torch.Generator().manual_seed(seed)
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=generator)
+    n_val   = max(1, int(n_total * val_split))
+    n_train = n_total - n_val
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
+    rng = np.random.default_rng(seed)
+    shuffled = paths.copy()
+    rng.shuffle(shuffled)
 
-    return train_loader, val_loader
+    train_paths = shuffled[:n_train]
+    val_paths   = shuffled[n_train:]
+
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices(train_paths)
+        .shuffle(max(len(train_paths), 1), seed=seed,
+                 reshuffle_each_iteration=True)
+        .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_ds = (
+        tf.data.Dataset.from_tensor_slices(val_paths)
+        .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    return train_ds, val_ds, n_train, n_val
