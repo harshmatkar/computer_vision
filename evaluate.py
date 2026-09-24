@@ -2,7 +2,7 @@
 evaluate.py
 -----------
 Runs trained-model inference on raw .tif images for ONE of the three
-registered models, producing:
+registered Keras models, producing:
   1. Binary segmentation output masks (saved to outputs/masks_pred_<model>/)
   2. A per-image row in outputs/actin_metrics_<model>.csv with the four
      biophysical metrics (PER, MCC, RAT, SPI) plus Dice/F1/IoU against the
@@ -24,11 +24,11 @@ import argparse
 
 import numpy as np
 import cv2
-import torch
+import tensorflow as tf
 
 import config
 from dataset import load_tif_image, preprocess_image
-from model_builder import build_model, get_final_output
+from model_builder import is_multi_output
 from utils.metrics import compute_all_metrics
 
 
@@ -57,7 +57,7 @@ def dice_f1_iou(pred_mask: np.ndarray, gt_mask: np.ndarray, eps: float = 1e-6):
 
 
 def load_model(model_name: str):
-    """Loads the trained model for `model_name` from its registered checkpoint."""
+    """Loads the trained Keras model for `model_name` from its registered checkpoint."""
     registry_entry = config.MODEL_REGISTRY[model_name]
     checkpoint_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
     if not os.path.exists(checkpoint_path):
@@ -65,27 +65,27 @@ def load_model(model_name: str):
             f"No checkpoint found at {checkpoint_path}. Run `python train.py --model {model_name}` first."
         )
 
-    checkpoint = torch.load(checkpoint_path, map_location=config.DEVICE)
-    model = build_model(model_name)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    print(f"Loaded checkpoint from {checkpoint_path} "
-          f"(epoch {checkpoint.get('epoch', '?')}, val_dice={checkpoint.get('val_dice', float('nan')):.4f})")
-    return model, checkpoint.get("num_parameters", sum(p.numel() for p in model.parameters()))
+    # custom_objects not needed: the saved .keras file embeds the full
+    # architecture; compile=False since we only need inference here.
+    model = tf.keras.models.load_model(checkpoint_path, compile=False)
+    print(f"Loaded checkpoint from {checkpoint_path} ({model.count_params():,} parameters)")
+    return model, model.count_params()
 
 
-def run_inference(model, image_resized: np.ndarray):
+def run_inference(model, image_resized: np.ndarray, model_name: str):
     """Runs a single forward pass and returns the binary predicted mask plus inference time."""
-    tensor = torch.from_numpy(image_resized).unsqueeze(0).unsqueeze(0).float().to(config.DEVICE)
+    tensor = image_resized.astype(np.float32)[np.newaxis, ..., np.newaxis]  # (1, H, W, 1)
 
     t0 = time.time()
-    with torch.no_grad():
-        outputs = model(tensor)
-        final_logits = get_final_output(outputs)
-        probs = torch.sigmoid(final_logits)
+    outputs = model(tensor, training=False)
+    if is_multi_output(model_name):
+        final_logits = outputs[-1]  # deepest / most-refined deep-supervision head
+    else:
+        final_logits = outputs
+    probs = tf.sigmoid(final_logits)
     inference_time = time.time() - t0
 
-    pred_mask = (probs.squeeze().cpu().numpy() >= config.SEGMENTATION_PROB_THRESHOLD).astype(np.uint8)
+    pred_mask = (probs.numpy().squeeze() >= config.SEGMENTATION_PROB_THRESHOLD).astype(np.uint8)
     return pred_mask, inference_time
 
 
@@ -140,7 +140,7 @@ def evaluate_model(model_name: str):
             footprint = processed["footprint"]
             reference_label = processed["edge_mask"]
 
-            pred_mask, inference_time = run_inference(model, resized)
+            pred_mask, inference_time = run_inference(model, resized, model_name)
 
             seg_scores = dice_f1_iou(pred_mask, reference_label)
             biophysical = compute_all_metrics(

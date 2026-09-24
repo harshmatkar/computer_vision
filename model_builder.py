@@ -2,21 +2,27 @@
 model_builder.py
 ------------------
 Central place that maps a model name ('unetpp', 'attention_unet',
-'resunetpp') to its constructor and its associated loss function, so
-train.py / evaluate.py don't need to hard-code architecture-specific
-branching logic in more than one place.
+'resunetpp') to its Keras architecture, its associated loss function, and
+a ready-to-train compiled model, so train.py / evaluate.py don't need
+architecture-specific branching logic in more than one place.
+
+Member A (UNet++) is a multi-output Keras model (deep supervision: one
+logits head per supervised decoder depth); Members B and C are
+single-output models. `is_multi_output()` / `num_outputs()` let train.py
+adapt the tf.data pipeline (duplicating the target mask once per output)
+without needing to know which architecture is currently selected.
 """
 
 import config
-from models.unet_plus_plus import LightUNetPlusPlus
-from models.attention_unet import AttentionUNet
-from models.resunet_pp import ResUNetPlusPlus
-from utils.losses import get_loss_fn
+from models.unet_plus_plus import build_unet_plus_plus
+from models.attention_unet import build_attention_unet
+from models.resunet_pp import build_resunet_pp
+from utils.losses import get_loss_fn, dice_metric
 
 
 def build_model(model_name: str):
     """
-    Instantiates the requested model on config.DEVICE.
+    Instantiates the requested (uncompiled) Keras model.
 
     Parameters
     ----------
@@ -26,65 +32,85 @@ def build_model(model_name: str):
 
     Returns
     -------
-    torch.nn.Module
+    tf.keras.Model
     """
     if model_name not in config.MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model_name {model_name!r}. Valid options: {list(config.MODEL_REGISTRY.keys())}"
         )
 
+    input_shape = (config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.IN_CHANNELS)
+
     if model_name == "unetpp":
-        model = LightUNetPlusPlus(
-            in_channels=config.IN_CHANNELS,
+        model = build_unet_plus_plus(
+            input_shape=input_shape,
             out_channels=config.OUT_CHANNELS,
             base_filters=config.BASE_FILTERS,
             depth=config.DEPTH,
             deep_supervision=config.USE_DEEP_SUPERVISION,
         )
     elif model_name == "attention_unet":
-        model = AttentionUNet(
-            in_channels=config.IN_CHANNELS,
+        model = build_attention_unet(
+            input_shape=input_shape,
             out_channels=config.OUT_CHANNELS,
             base_filters=config.BASE_FILTERS,
             depth=config.DEPTH,
         )
     elif model_name == "resunetpp":
-        model = ResUNetPlusPlus(
-            in_channels=config.IN_CHANNELS,
+        model = build_resunet_pp(
+            input_shape=input_shape,
             out_channels=config.OUT_CHANNELS,
             base_filters=config.BASE_FILTERS,
             depth=3,  # ResUNet++ uses 3 encoder stages in the original paper
         )
 
-    return model.to(config.DEVICE)
+    return model
 
 
-def build_loss(model_name: str):
-    """Returns the configured loss_fn(pred_logits, target) callable for this model."""
-    loss_name = config.MODEL_REGISTRY[model_name]["loss"]
-    return get_loss_fn(loss_name, config)
+def is_multi_output(model_name: str) -> bool:
+    """Only Member A's UNet++ uses deep supervision (multiple output heads)."""
+    return model_name == "unetpp" and config.USE_DEEP_SUPERVISION
 
 
-def get_final_output(outputs):
+def num_outputs(model_name: str) -> int:
+    """Number of output heads for this model (used to shape the tf.data targets)."""
+    if is_multi_output(model_name):
+        return config.DEPTH
+    return 1
+
+
+def build_and_compile(model_name: str):
     """
-    Normalizes model output to a single logits tensor.
-    Only Member A's UNet++ returns a list (deep supervision); Members B and C
-    return a single tensor directly.
-    """
-    if isinstance(outputs, (list, tuple)):
-        return outputs[-1]
-    return outputs
+    Builds the requested model and compiles it with its registered loss
+    function, the Adam optimizer, and Dice-coefficient tracking.
 
+    For the multi-output UNet++ (deep supervision), the same loss and
+    metric are applied to every output head with equal loss_weights, so
+    Keras averages the loss across all supervised depths internally --
+    equivalent to manually averaging a list of per-depth losses.
 
-def compute_loss(model_name: str, loss_fn, outputs, target):
+    Returns
+    -------
+    model : compiled tf.keras.Model
     """
-    Applies `loss_fn` to model outputs, averaging across all deep-supervision
-    heads if the model returns a list (UNet++), or applying it directly to
-    a single logits tensor otherwise (Attention U-Net, ResUNet++).
-    """
-    if isinstance(outputs, (list, tuple)):
-        losses = [loss_fn(out, target) for out in outputs]
-        import torch
-        return torch.stack(losses).mean()
+    import tensorflow as tf
+
+    model = build_model(model_name)
+    loss_fn = get_loss_fn(config.MODEL_REGISTRY[model_name]["loss"], config)
+
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
+    )
+
+    if is_multi_output(model_name):
+        n_out = num_outputs(model_name)
+        model.compile(
+            optimizer=optimizer,
+            loss=[loss_fn] * n_out,
+            loss_weights=[1.0 / n_out] * n_out,
+            metrics=[[dice_metric]] * n_out,
+        )
     else:
-        return loss_fn(outputs, target)
+        model.compile(optimizer=optimizer, loss=loss_fn, metrics=[dice_metric])
+
+    return model

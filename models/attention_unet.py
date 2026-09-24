@@ -2,7 +2,8 @@
 models/attention_unet.py
 --------------------------
 Attention U-Net (Oktay et al., "Attention U-Net: Learning Where to Look for
-the Pancreas," arXiv:1804.03999, 2018).
+the Pancreas," arXiv:1804.03999, 2018), implemented in TensorFlow/Keras
+using the Functional API.
 
 Core idea
 ---------
@@ -10,10 +11,10 @@ A standard U-Net skip connection copies the encoder feature map at a given
 depth directly to the decoder. Attention U-Net inserts an "Attention Gate"
 (AG) on every skip connection: the gate looks at both the incoming encoder
 features AND the coarser, more semantically-refined decoder features from
-one level deeper, and produces a per-pixel gating coefficient in [0, 1] that
-suppresses activations in regions irrelevant to the segmentation target
-(here: the cytosolic interior) while preserving activations near the
-membrane/actin-edge region.
+one level deeper, and produces a per-pixel gating coefficient in [0, 1]
+that suppresses activations in regions irrelevant to the segmentation
+target (here: the cytosolic interior) while preserving activations near
+the membrane/actin-edge region.
 
 This is a genuinely different mechanism from the nested skip pathways used
 in Member A's UNet++: attention gating reweights WHERE in the image to
@@ -21,156 +22,101 @@ trust encoder features, whereas UNet++ changes HOW MANY intermediate
 processing steps a skip connection passes through.
 """
 
-import torch
-import torch.nn as nn
+import tensorflow as tf
+from tensorflow.keras import layers, Model
 
 
-class ConvBlock(nn.Module):
+def conv_block(x, filters: int, name_prefix: str):
     """Two stacked standard 3x3 Conv -> BN -> ReLU layers."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.block(x)
+    x = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=f"{name_prefix}_conv1")(x)
+    x = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
+    x = layers.ReLU(name=f"{name_prefix}_relu1")(x)
+    x = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=f"{name_prefix}_conv2")(x)
+    x = layers.BatchNormalization(name=f"{name_prefix}_bn2")(x)
+    x = layers.ReLU(name=f"{name_prefix}_relu2")(x)
+    return x
 
 
-class AttentionGate(nn.Module):
+def attention_gate(g, x, inter_channels: int, name_prefix: str):
     """
     Attention Gate (AG) as described in Oktay et al., 2018.
 
     Parameters
     ----------
-    gate_channels : int
-        Number of channels in the gating signal `g` (from the coarser,
-        deeper decoder stage).
-    skip_channels : int
-        Number of channels in the skip-connection feature map `x` (from the
-        matching encoder stage).
-    inter_channels : int
-        Number of channels in the shared intermediate space where `g` and
-        `x` are compared.
-
-    Forward
-    -------
-    g : gating signal from the decoder (coarser resolution, upsampled to
-        match `x`'s spatial size before calling this module).
+    g : gating signal from the decoder (coarser resolution, already
+        upsampled to match `x`'s spatial size before calling this function).
     x : encoder skip-connection features (finer resolution).
+    inter_channels : number of channels in the shared intermediate space
+        where `g` and `x` are compared.
 
     Returns
     -------
     x * alpha : the skip features re-weighted by the learned attention map,
                 same shape as `x`.
     """
+    theta_g = layers.Conv2D(inter_channels, 1, padding="same", name=f"{name_prefix}_theta_g")(g)
+    theta_g = layers.BatchNormalization(name=f"{name_prefix}_bn_g")(theta_g)
 
-    def __init__(self, gate_channels: int, skip_channels: int, inter_channels: int):
-        super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv2d(gate_channels, inter_channels, kernel_size=1, bias=True),
-            nn.BatchNorm2d(inter_channels),
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv2d(skip_channels, inter_channels, kernel_size=1, bias=True),
-            nn.BatchNorm2d(inter_channels),
-        )
-        self.psi = nn.Sequential(
-            nn.Conv2d(inter_channels, 1, kernel_size=1, bias=True),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid(),
-        )
-        self.relu = nn.ReLU(inplace=True)
+    phi_x = layers.Conv2D(inter_channels, 1, padding="same", name=f"{name_prefix}_phi_x")(x)
+    phi_x = layers.BatchNormalization(name=f"{name_prefix}_bn_x")(phi_x)
 
-    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        # Additive attention: combine gate and skip signals, then squash to
-        # a single-channel spatial attention map alpha in [0, 1].
-        psi = self.relu(g1 + x1)
-        alpha = self.psi(psi)
-        return x * alpha
+    # Additive attention: combine gate and skip signals, then squash to a
+    # single-channel spatial attention map alpha in [0, 1].
+    psi_in = layers.ReLU(name=f"{name_prefix}_relu")(layers.Add(name=f"{name_prefix}_add")([theta_g, phi_x]))
+    psi = layers.Conv2D(1, 1, padding="same", name=f"{name_prefix}_psi")(psi_in)
+    psi = layers.BatchNormalization(name=f"{name_prefix}_bn_psi")(psi)
+    alpha = layers.Activation("sigmoid", name=f"{name_prefix}_sigmoid")(psi)
+
+    return layers.Multiply(name=f"{name_prefix}_gated")([x, alpha])
 
 
-class AttentionUNet(nn.Module):
+def build_attention_unet(input_shape=(256, 256, 1), out_channels=1, base_filters=16,
+                          depth=4) -> Model:
     """
-    Full Attention U-Net: standard convolutional encoder/decoder with an
-    AttentionGate applied to every skip connection before concatenation.
+    Builds the full Attention U-Net Keras model: standard convolutional
+    encoder/decoder with an attention_gate() applied to every skip
+    connection before concatenation.
 
-    Parameters
-    ----------
-    in_channels, out_channels, base_filters, depth : same meaning as in
-        models/unet_plus_plus.py, kept consistent across all three
-        team-member models for a fair parameter-count comparison.
+    Parameters mirror models/unet_plus_plus.py for a fair parameter-count
+    comparison across all three team-member models.
     """
+    filters = [base_filters * (2 ** i) for i in range(depth + 1)]
 
-    def __init__(self, in_channels=1, out_channels=1, base_filters=16, depth=4):
-        super().__init__()
-        self.depth = depth
-        filters = [base_filters * (2 ** i) for i in range(depth + 1)]
+    inputs = layers.Input(shape=input_shape, name="input_image")
 
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+    # --- Encoder, caching skip features at every depth -------------------------
+    skips = []
+    cur = inputs
+    for i in range(depth + 1):
+        cur = conv_block(cur, filters[i], name_prefix=f"enc_{i}")
+        skips.append(cur)
+        if i < depth:
+            cur = layers.MaxPooling2D(pool_size=2, name=f"pool_{i}")(cur)
 
-        # --- Encoder -------------------------------------------------------
-        self.encoders = nn.ModuleList()
-        in_ch = in_channels
-        for i in range(depth + 1):
-            self.encoders.append(ConvBlock(in_ch, filters[i]))
-            in_ch = filters[i]
+    # --- Decoder with attention-gated skip fusion -----------------------------
+    d = skips[-1]  # bottleneck features
+    for depth_i in reversed(range(depth)):
+        g = layers.UpSampling2D(size=2, interpolation="bilinear", name=f"up_{depth_i}")(d)
+        skip = skips[depth_i]
+        gated_skip = attention_gate(g, skip, inter_channels=filters[depth_i] // 2,
+                                     name_prefix=f"ag_{depth_i}")
+        d = layers.Concatenate(name=f"concat_{depth_i}")([gated_skip, g])
+        d = conv_block(d, filters[depth_i], name_prefix=f"dec_{depth_i}")
 
-        # --- Decoder + Attention Gates -------------------------------------
-        self.attention_gates = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-        for i in reversed(range(depth)):
-            # Gate signal comes from filters[i+1] (one level deeper/coarser),
-            # skip connection comes from filters[i] (encoder at this depth).
-            self.attention_gates.append(
-                AttentionGate(gate_channels=filters[i + 1], skip_channels=filters[i],
-                              inter_channels=filters[i] // 2)
-            )
-            # After concatenating the gated skip (filters[i]) with the
-            # upsampled decoder features (filters[i+1]), run a ConvBlock
-            # back down to filters[i] channels.
-            self.decoders.append(ConvBlock(filters[i] + filters[i + 1], filters[i]))
+    outputs = layers.Conv2D(out_channels, kernel_size=1, name="output_final")(d)
 
-        self.final_conv = nn.Conv2d(filters[0], out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # --- Encoder path, caching skip features at every depth -----------
-        skips = []
-        cur = x
-        for i, enc in enumerate(self.encoders):
-            cur = enc(cur)
-            skips.append(cur)
-            if i < self.depth:
-                cur = self.pool(cur)
-
-        # --- Decoder path with attention-gated skip fusion -----------------
-        d = skips[-1]  # bottleneck features
-        for idx, depth_i in enumerate(reversed(range(self.depth))):
-            g = self.up(d)  # upsample the coarser decoder/bottleneck signal
-            skip = skips[depth_i]
-            gated_skip = self.attention_gates[idx](g=g, x=skip)
-            d = torch.cat([gated_skip, g], dim=1)
-            d = self.decoders[idx](d)
-
-        return self.final_conv(d)  # single logits tensor, no deep supervision
+    model = Model(inputs=inputs, outputs=outputs, name="AttentionUNet")
+    return model
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_parameters(model: Model) -> int:
+    return int(sum(tf.size(w).numpy() for w in model.trainable_weights))
 
 
 if __name__ == "__main__":
-    model = AttentionUNet(in_channels=1, out_channels=1, base_filters=16, depth=4)
-    dummy = torch.randn(2, 1, 256, 256)
+    model = build_attention_unet(input_shape=(256, 256, 1), out_channels=1,
+                                  base_filters=16, depth=4)
+    dummy = tf.random.normal((2, 256, 256, 1))
     out = model(dummy)
     print(f"Output shape: {tuple(out.shape)}")
     print(f"Total trainable parameters: {count_parameters(model):,}")

@@ -2,13 +2,14 @@
 models/resunet_pp.py
 ----------------------
 ResUNet++ (Jha, D. et al., "ResUNet++: An Advanced Architecture for Medical
-Image Segmentation," IEEE International Symposium on Multimedia (ISM), 2019).
+Image Segmentation," IEEE International Symposium on Multimedia (ISM), 2019),
+implemented in TensorFlow/Keras using the Functional API.
 
 Combines four separate ideas from four separate papers into one network:
 
-  1. Residual blocks       (He et al., ResNet lineage / Zhang et al. 2018
-                             "Road Extraction by Deep Residual U-Net")
-  2. Squeeze-and-Excitation (Hu, Shen & Sun, CVPR 2018)
+  1. Residual blocks        (He et al., ResNet lineage / Zhang et al. 2018
+                              "Road Extraction by Deep Residual U-Net")
+  2. Squeeze-and-Excitation  (Hu, Shen & Sun, CVPR 2018)
   3. Atrous Spatial Pyramid Pooling / ASPP (Chen et al., DeepLab lineage)
   4. Attention-gated decoder skip connections (same idea family as
      Attention U-Net, applied at the decoder stage only)
@@ -21,12 +22,11 @@ bridge via parallel dilated convolutions (ASPP), neither of which the other
 two models do.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
+from tensorflow.keras import layers, Model
 
 
-class SqueezeExcitation(nn.Module):
+def squeeze_excitation(x, reduction: int = 8, name_prefix: str = "se"):
     """
     Squeeze-and-Excitation block (Hu, Shen & Sun, CVPR 2018).
 
@@ -34,69 +34,57 @@ class SqueezeExcitation(nn.Module):
     extent (H x W) down to a single scalar, producing a channel descriptor
     that summarizes the global response of that channel across the image.
 
-    "Excitation": a small two-layer MLP (implemented as 1x1 convs here)
-    maps that channel descriptor through a bottleneck and back out to a
-    per-channel scaling factor in [0, 1] via a sigmoid, which is then
-    broadcast-multiplied back onto the original feature map. Channels the
-    network finds more informative for the current input are scaled up;
-    less relevant channels are scaled down.
+    "Excitation": a small two-layer bottleneck (1x1 convs here) maps that
+    channel descriptor through a reduced dimension and back out to a
+    per-channel scaling factor in [0, 1] via a sigmoid, broadcast-multiplied
+    back onto the original feature map. Channels the network finds more
+    informative for the current input are scaled up; less relevant channels
+    are scaled down.
     """
+    channels = x.shape[-1]
+    reduced = max(1, channels // reduction)
 
-    def __init__(self, channels: int, reduction: int = 8):
-        super().__init__()
-        reduced = max(1, channels // reduction)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, reduced, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        scale = self.fc(self.pool(x))
-        return x * scale
+    s = layers.GlobalAveragePooling2D(name=f"{name_prefix}_pool")(x)
+    s = layers.Reshape((1, 1, channels), name=f"{name_prefix}_reshape")(s)
+    s = layers.Conv2D(reduced, 1, activation="relu", name=f"{name_prefix}_fc1")(s)
+    s = layers.Conv2D(channels, 1, activation="sigmoid", name=f"{name_prefix}_fc2")(s)
+    return layers.Multiply(name=f"{name_prefix}_scale")([x, s])
 
 
-class ResidualSEBlock(nn.Module):
+def residual_se_block(x, out_channels: int, stride: int = 1, name_prefix: str = "res"):
     """
     Residual block with an SE block applied to the residual branch before
     the skip-addition, matching the "residual + squeeze-excitation" encoder
     unit used throughout ResUNet++.
     """
+    in_channels = x.shape[-1]
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride, bias=False),
-        )
-        self.conv2 = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-        )
-        self.se = SqueezeExcitation(out_channels)
+    residual = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
+    residual = layers.ReLU(name=f"{name_prefix}_relu1")(residual)
+    residual = layers.Conv2D(out_channels, 3, strides=stride, padding="same", use_bias=False,
+                              name=f"{name_prefix}_conv1")(residual)
 
-        # Projection shortcut when input/output channel counts or spatial
-        # resolution differ (standard ResNet-style identity/projection choice).
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
-        else:
-            self.shortcut = nn.Identity()
+    residual = layers.BatchNormalization(name=f"{name_prefix}_bn2")(residual)
+    residual = layers.ReLU(name=f"{name_prefix}_relu2")(residual)
+    residual = layers.Conv2D(out_channels, 3, padding="same", use_bias=False,
+                              name=f"{name_prefix}_conv2")(residual)
 
-    def forward(self, x):
-        residual = self.conv1(x)
-        residual = self.conv2(residual)
-        residual = self.se(residual)
-        return residual + self.shortcut(x)
+    residual = squeeze_excitation(residual, name_prefix=f"{name_prefix}_se")
+
+    # Projection shortcut when input/output channel counts or spatial
+    # resolution differ (standard ResNet-style identity/projection choice).
+    if stride != 1 or in_channels != out_channels:
+        shortcut = layers.Conv2D(out_channels, 1, strides=stride, use_bias=False,
+                                  name=f"{name_prefix}_shortcut")(x)
+    else:
+        shortcut = x
+
+    return layers.Add(name=f"{name_prefix}_add")([residual, shortcut])
 
 
-class ASPP(nn.Module):
+def aspp_block(x, out_channels: int, dilations=(1, 6, 12, 18), name_prefix: str = "aspp"):
     """
-    Atrous Spatial Pyramid Pooling (Chen et al., DeepLab lineage), placed at
-    the network's bridge (bottleneck) exactly as in the original ResUNet++.
+    Atrous Spatial Pyramid Pooling (Chen et al., DeepLab lineage).
 
     Runs several atrous (dilated) 3x3 convolutions in parallel at different
     dilation rates -- each rate expands the receptive field without adding
@@ -104,158 +92,120 @@ class ASPP(nn.Module):
     global-average-pooling branch for whole-image context, then fuses all
     branches with a final 1x1 convolution.
     """
+    h, w = x.shape[1], x.shape[2]
+    branches = []
+    for idx, d in enumerate(dilations):
+        if d == 1:
+            b = layers.Conv2D(out_channels, 1, use_bias=False, name=f"{name_prefix}_b{idx}_conv")(x)
+        else:
+            b = layers.Conv2D(out_channels, 3, padding="same", dilation_rate=d, use_bias=False,
+                               name=f"{name_prefix}_b{idx}_conv")(x)
+        b = layers.BatchNormalization(name=f"{name_prefix}_b{idx}_bn")(b)
+        b = layers.ReLU(name=f"{name_prefix}_b{idx}_relu")(b)
+        branches.append(b)
 
-    def __init__(self, in_channels: int, out_channels: int, dilations=(1, 6, 12, 18)):
-        super().__init__()
-        self.branches = nn.ModuleList()
-        for d in dilations:
-            if d == 1:
-                self.branches.append(nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
-                ))
-            else:
-                self.branches.append(nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=d, dilation=d, bias=False),
-                    nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
-                ))
+    g = layers.GlobalAveragePooling2D(name=f"{name_prefix}_global_pool")(x)
+    g = layers.Reshape((1, 1, x.shape[-1]), name=f"{name_prefix}_global_reshape")(g)
+    g = layers.Conv2D(out_channels, 1, use_bias=False, name=f"{name_prefix}_global_conv")(g)
+    g = layers.ReLU(name=f"{name_prefix}_global_relu")(g)
+    g = layers.Resizing(h, w, interpolation="bilinear", name=f"{name_prefix}_global_resize")(g)
+    branches.append(g)
 
-        self.global_branch = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-        )
-
-        self.project = nn.Sequential(
-            nn.Conv2d(out_channels * (len(dilations) + 1), out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        h, w = x.shape[2], x.shape[3]
-        branch_outs = [branch(x) for branch in self.branches]
-        global_out = self.global_branch(x)
-        global_out = F.interpolate(global_out, size=(h, w), mode="bilinear", align_corners=True)
-        branch_outs.append(global_out)
-        return self.project(torch.cat(branch_outs, dim=1))
+    concat = layers.Concatenate(name=f"{name_prefix}_concat")(branches)
+    out = layers.Conv2D(out_channels, 1, use_bias=False, name=f"{name_prefix}_project_conv")(concat)
+    out = layers.BatchNormalization(name=f"{name_prefix}_project_bn")(out)
+    out = layers.ReLU(name=f"{name_prefix}_project_relu")(out)
+    return out
 
 
-class DecoderAttentionBlock(nn.Module):
+def decoder_attention_block(skip, gate, name_prefix: str = "dec_attn"):
     """
     Lightweight attention block applied to the encoder skip connection
     before it is concatenated into the decoder, in the same spirit as
     Attention U-Net's gate but implemented via the simpler channel+spatial
     squeeze used in the original ResUNet++ decoder.
     """
+    skip_channels = skip.shape[-1]
+    h, w = skip.shape[1], skip.shape[2]
 
-    def __init__(self, skip_channels: int, gate_channels: int):
-        super().__init__()
-        self.gate_conv = nn.Sequential(
-            nn.BatchNorm2d(gate_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(gate_channels, skip_channels, kernel_size=3, padding=1, bias=False),
-        )
-        self.skip_conv = nn.Sequential(
-            nn.BatchNorm2d(skip_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(skip_channels, skip_channels, kernel_size=3, padding=1, bias=False),
-        )
-        self.attn = nn.Sequential(
-            nn.BatchNorm2d(skip_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(skip_channels, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
+    g = layers.Resizing(h, w, interpolation="bilinear", name=f"{name_prefix}_resize")(gate)
+    g = layers.BatchNormalization(name=f"{name_prefix}_bn_g")(g)
+    g = layers.ReLU(name=f"{name_prefix}_relu_g")(g)
+    g = layers.Conv2D(skip_channels, 3, padding="same", use_bias=False,
+                       name=f"{name_prefix}_conv_g")(g)
 
-    def forward(self, skip, gate):
-        g = F.interpolate(gate, size=skip.shape[2:], mode="bilinear", align_corners=True)
-        g = self.gate_conv(g)
-        s = self.skip_conv(skip)
-        alpha = self.attn(g + s)
-        return skip * alpha
+    s = layers.BatchNormalization(name=f"{name_prefix}_bn_s")(skip)
+    s = layers.ReLU(name=f"{name_prefix}_relu_s")(s)
+    s = layers.Conv2D(skip_channels, 3, padding="same", use_bias=False,
+                       name=f"{name_prefix}_conv_s")(s)
+
+    combined = layers.Add(name=f"{name_prefix}_add")([g, s])
+    combined = layers.BatchNormalization(name=f"{name_prefix}_bn_c")(combined)
+    combined = layers.ReLU(name=f"{name_prefix}_relu_c")(combined)
+    alpha = layers.Conv2D(1, 1, activation="sigmoid", name=f"{name_prefix}_alpha")(combined)
+
+    return layers.Multiply(name=f"{name_prefix}_gated")([skip, alpha])
 
 
-class ResUNetPlusPlus(nn.Module):
+def build_resunet_pp(input_shape=(256, 256, 1), out_channels=1, base_filters=16,
+                      depth=3) -> Model:
     """
-    Full ResUNet++: stem block -> 3 residual-SE encoder stages -> ASPP
-    bridge -> 3 attention-gated decoder stages -> 1x1 output head.
+    Builds the full ResUNet++ Keras model: stem block -> `depth` residual-SE
+    encoder stages -> ASPP bridge -> `depth` attention-gated decoder stages
+    -> output ASPP -> 1x1 output head.
 
-    Parameters mirror models/unet_plus_plus.py and models/attention_unet.py
-    for a fair three-way parameter-count comparison in the final report.
+    Parameters mirror unet_plus_plus.py and attention_unet.py for a fair
+    three-way parameter-count comparison in the final report.
     """
+    filters = [base_filters * (2 ** i) for i in range(depth + 1)]  # e.g. [16, 32, 64, 128]
 
-    def __init__(self, in_channels=1, out_channels=1, base_filters=16, depth=3):
-        super().__init__()
-        self.depth = depth
-        filters = [base_filters * (2 ** i) for i in range(depth + 1)]  # e.g. [16, 32, 64, 128]
+    inputs = layers.Input(shape=input_shape, name="input_image")
 
-        # --- Stem block (initial feature extraction, not yet residual) -----
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(filters[0]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
-        )
-        self.stem_shortcut = nn.Conv2d(in_channels, filters[0], kernel_size=1, bias=False)
+    # --- Stem block (initial feature extraction, not yet residual) -----------
+    stem = layers.Conv2D(filters[0], 3, padding="same", use_bias=False, name="stem_conv1")(inputs)
+    stem = layers.BatchNormalization(name="stem_bn")(stem)
+    stem = layers.ReLU(name="stem_relu")(stem)
+    stem = layers.Conv2D(filters[0], 3, padding="same", use_bias=False, name="stem_conv2")(stem)
+    stem_shortcut = layers.Conv2D(filters[0], 1, use_bias=False, name="stem_shortcut")(inputs)
+    stem_out = layers.Add(name="stem_add")([stem, stem_shortcut])
 
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+    # --- Encoder, caching skip features ---------------------------------------
+    skips = [stem_out]
+    cur = stem_out
+    for i in range(1, depth + 1):
+        cur = layers.MaxPooling2D(pool_size=2, name=f"pool_{i}")(cur)
+        cur = residual_se_block(cur, filters[i], name_prefix=f"enc_{i}")
+        skips.append(cur)
 
-        # --- Encoder: residual + SE blocks, downsampling between stages ----
-        self.encoders = nn.ModuleList()
-        for i in range(1, depth + 1):
-            self.encoders.append(ResidualSEBlock(filters[i - 1], filters[i]))
+    # --- Bridge: ASPP -----------------------------------------------------------
+    bridge = aspp_block(cur, filters[depth], name_prefix="aspp_bridge")
 
-        # --- Bridge: ASPP -----------------------------------------------------
-        self.aspp_bridge = ASPP(filters[depth], filters[depth])
+    # --- Decoder: attention-gated skip fusion + residual blocks ----------------
+    d = bridge
+    for depth_i in reversed(range(depth)):
+        skip = skips[depth_i]
+        gated_skip = decoder_attention_block(skip, d, name_prefix=f"dec_attn_{depth_i}")
+        h, w = skip.shape[1], skip.shape[2]
+        d_up = layers.Resizing(h, w, interpolation="bilinear", name=f"up_{depth_i}")(d)
+        d = layers.Concatenate(name=f"concat_{depth_i}")([gated_skip, d_up])
+        d = residual_se_block(d, filters[depth_i], name_prefix=f"dec_{depth_i}")
 
-        # --- Decoder: attention-gated skip fusion + residual blocks --------
-        self.decoder_attn = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-        for i in reversed(range(depth)):
-            self.decoder_attn.append(DecoderAttentionBlock(skip_channels=filters[i], gate_channels=filters[i + 1]))
-            self.decoders.append(ResidualSEBlock(filters[i] + filters[i + 1], filters[i]))
+    # --- Output ASPP + head (as in the original paper's final stage) -----------
+    out = aspp_block(d, filters[0], name_prefix="aspp_out")
+    outputs = layers.Conv2D(out_channels, 1, name="output_final")(out)
 
-        # --- Output ASPP + head (as in the original paper's final stage) ----
-        self.aspp_out = ASPP(filters[0], filters[0])
-        self.final_conv = nn.Conv2d(filters[0], out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # --- Stem ------------------------------------------------------------
-        stem_out = self.stem(x) + self.stem_shortcut(x)
-
-        # --- Encoder, caching skip features ------------------------------
-        skips = [stem_out]
-        cur = stem_out
-        for i, enc in enumerate(self.encoders):
-            cur = self.pool(cur)
-            cur = enc(cur)
-            skips.append(cur)
-
-        # --- Bridge -----------------------------------------------------------
-        bridge = self.aspp_bridge(cur)
-
-        # --- Decoder ----------------------------------------------------------
-        d = bridge
-        for idx, depth_i in enumerate(reversed(range(self.depth))):
-            skip = skips[depth_i]
-            gated_skip = self.decoder_attn[idx](skip=skip, gate=d)
-            d_up = F.interpolate(d, size=skip.shape[2:], mode="bilinear", align_corners=True)
-            d = torch.cat([gated_skip, d_up], dim=1)
-            d = self.decoders[idx](d)
-
-        out = self.aspp_out(d)
-        return self.final_conv(out)  # single logits tensor, no deep supervision
+    model = Model(inputs=inputs, outputs=outputs, name="ResUNetPlusPlus")
+    return model
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_parameters(model: Model) -> int:
+    return int(sum(tf.size(w).numpy() for w in model.trainable_weights))
 
 
 if __name__ == "__main__":
-    model = ResUNetPlusPlus(in_channels=1, out_channels=1, base_filters=16, depth=3)
-    dummy = torch.randn(2, 1, 256, 256)
+    model = build_resunet_pp(input_shape=(256, 256, 1), out_channels=1,
+                              base_filters=16, depth=3)
+    dummy = tf.random.normal((2, 256, 256, 1))
     out = model(dummy)
     print(f"Output shape: {tuple(out.shape)}")
     print(f"Total trainable parameters: {count_parameters(model):,}")

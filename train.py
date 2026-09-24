@@ -1,77 +1,49 @@
 """
 train.py
 --------
-Training loop shared by all three team-member models. Select which model
-to train with the --model flag:
+Training entry point shared by all three team-member models, using the
+standard Keras `model.fit()` workflow. Select which model to train with
+the --model flag:
 
-    python train.py --model unetpp               # Member A: BCE + Dice loss
-    python train.py --model attention_unet        # Member B: Tversky loss
-    python train.py --model resunetpp              # Member C: Combo loss
-    python train.py --all                          # train all three sequentially
+    python train.py --model unetpp             # Member A: BCE + Dice loss
+    python train.py --model attention_unet      # Member B: Tversky loss
+    python train.py --model resunetpp             # Member C: Combo loss
+    python train.py --all                         # train all three sequentially
 
-Each model gets its own checkpoint file and training-history CSV (see
-config.MODEL_REGISTRY), so all three can be trained independently and then
-benchmarked side by side in evaluate.py / the final report.
+Each model gets its own checkpoint file (.keras) and training-history CSV
+(see config.MODEL_REGISTRY), so all three can be trained independently and
+then benchmarked side by side in evaluate.py / the final report.
 
-Features:
-  - Loss function automatically selected per model (utils/losses.py)
-  - Deep supervision handled transparently for models that use it (UNet++)
-  - Per-epoch training & validation loss + Dice coefficient tracking
-  - Model checkpointing (saves best validation Dice)
-  - Early stopping
+Implementation notes:
+  - Loss function is selected per model in model_builder.build_and_compile()
+  - Member A (UNet++) uses deep supervision: a multi-output Keras model.
+    Since tf.data yields a single (image, mask) pair per example, this
+    file duplicates the mask once per output head via model_builder's
+    num_outputs() before calling model.fit() -- Keras requires the target
+    structure to match the model's output structure for multi-output models.
+  - Checkpointing, CSV history logging, and early stopping are all handled
+    by standard Keras callbacks (ModelCheckpoint, CSVLogger, EarlyStopping).
 """
 
 import os
-import csv
 import time
-import copy
 import argparse
 
-import torch
-import torch.optim as optim
+import tensorflow as tf
 
 import config
-from dataset import get_dataloaders
-from model_builder import build_model, build_loss, get_final_output, compute_loss
-from utils.losses import dice_coefficient
+from dataset import get_datasets
+from model_builder import build_and_compile, is_multi_output, num_outputs
 
 
-def run_epoch(model, model_name, loader, optimizer, loss_fn, device, train: bool = True):
+def _duplicate_target_for_multi_output(ds: tf.data.Dataset, n_outputs: int) -> tf.data.Dataset:
     """
-    Runs one full pass over `loader`, either in training mode (with
-    backprop) or evaluation mode (no gradient updates).
-
-    Returns
-    -------
-    (avg_loss, avg_dice) : tuple of float
+    Reshapes a (image, mask) tf.data.Dataset into (image, (mask, mask, ...))
+    with `n_outputs` copies of the mask, matching a multi-output model's
+    expected target structure (used only for UNet++'s deep supervision).
     """
-    model.train() if train else model.eval()
-
-    total_loss, total_dice, n_batches = 0.0, 0.0, 0
-    context = torch.enable_grad() if train else torch.no_grad()
-
-    with context:
-        for images, masks, _ in loader:
-            images, masks = images.to(device), masks.to(device)
-
-            if train:
-                optimizer.zero_grad()
-
-            outputs = model(images)
-            loss = compute_loss(model_name, loss_fn, outputs, masks)
-
-            if train:
-                loss.backward()
-                optimizer.step()
-
-            final_out = get_final_output(outputs)
-            dice = dice_coefficient(final_out, masks)
-
-            total_loss += loss.item()
-            total_dice += dice.item()
-            n_batches += 1
-
-    return total_loss / max(n_batches, 1), total_dice / max(n_batches, 1)
+    return ds.map(lambda img, mask: (img, tuple(mask for _ in range(n_outputs))),
+                  num_parallel_calls=tf.data.AUTOTUNE)
 
 
 def train_model(model_name: str = None):
@@ -83,71 +55,58 @@ def train_model(model_name: str = None):
         raise ValueError(f"Unknown model {model_name!r}. Choose from {list(config.MODEL_REGISTRY.keys())}")
 
     registry_entry = config.MODEL_REGISTRY[model_name]
-    device = config.DEVICE
 
     print(f"=== Training {registry_entry['display_name']} (model_name='{model_name}') ===")
-    print(f"Using device: {device}")
+    print(f"GPU available: {config.GPU_AVAILABLE}")
     print(f"Loss function: {registry_entry['loss']}")
 
-    train_loader, val_loader = get_dataloaders()
-    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    train_ds, val_ds, n_train, n_val = get_datasets()
+    print(f"Train images: {n_train} | Val images: {n_val}")
 
-    model = build_model(model_name)
-    loss_fn = build_loss(model_name)
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model = build_and_compile(model_name)
+    n_params = model.count_params()
     print(f"Model parameter count: {n_params:,}")
 
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE,
-                            weight_decay=config.WEIGHT_DECAY)
+    if is_multi_output(model_name):
+        n_out = num_outputs(model_name)
+        train_ds = _duplicate_target_for_multi_output(train_ds, n_out)
+        val_ds = _duplicate_target_for_multi_output(val_ds, n_out)
 
     history_path = os.path.join(config.OUTPUT_DIR, f"training_history_{model_name}.csv")
-    with open(history_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "train_dice", "val_loss", "val_dice",
-                          "epoch_time_sec"])
+    ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
 
-    best_val_dice = -1.0
-    best_model_state = None
-    epochs_without_improvement = 0
+    # Keras tracks a separate metric per output for multi-output models,
+    # named "val_<output_layer_name>_<metric_fn_name>". For UNet++ we
+    # monitor the deepest output (the one actually used at inference time).
+    if is_multi_output(model_name):
+        monitor_metric = f"val_output_{config.DEPTH}_dice_metric"
+    else:
+        monitor_metric = "val_dice_metric"
 
-    for epoch in range(1, config.NUM_EPOCHS + 1):
-        t0 = time.time()
-        train_loss, train_dice = run_epoch(model, model_name, train_loader, optimizer, loss_fn, device, train=True)
-        val_loss, val_dice = run_epoch(model, model_name, val_loader, optimizer, loss_fn, device, train=False)
-        epoch_time = time.time() - t0
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=ckpt_path, monitor=monitor_metric, mode="max",
+            save_best_only=True, verbose=1,
+        ),
+        tf.keras.callbacks.CSVLogger(history_path),
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor_metric, mode="max",
+            patience=config.EARLY_STOP_PATIENCE, restore_best_weights=True, verbose=1,
+        ),
+    ]
 
-        print(f"Epoch {epoch:03d}/{config.NUM_EPOCHS} | "
-              f"train_loss={train_loss:.4f} train_dice={train_dice:.4f} | "
-              f"val_loss={val_loss:.4f} val_dice={val_dice:.4f} | "
-              f"time={epoch_time:.1f}s")
+    t0 = time.time()
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=config.NUM_EPOCHS,
+        callbacks=callbacks,
+        verbose=2,
+    )
+    total_time = time.time() - t0
 
-        with open(history_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, train_dice, val_loss, val_dice, epoch_time])
-
-        if val_dice > best_val_dice:
-            best_val_dice = val_dice
-            best_model_state = copy.deepcopy(model.state_dict())
-            epochs_without_improvement = 0
-            ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
-            torch.save({
-                "epoch": epoch,
-                "model_name": model_name,
-                "model_state_dict": best_model_state,
-                "val_dice": best_val_dice,
-                "num_parameters": n_params,
-            }, ckpt_path)
-            print(f"  -> New best model saved (val_dice={best_val_dice:.4f}) at {ckpt_path}")
-        else:
-            epochs_without_improvement += 1
-
-        if epochs_without_improvement >= config.EARLY_STOP_PATIENCE:
-            print(f"Early stopping triggered after {epoch} epochs "
-                  f"(no improvement for {config.EARLY_STOP_PATIENCE} epochs).")
-            break
-
-    print(f"Training complete for {model_name}. Best validation Dice: {best_val_dice:.4f}")
+    print(f"Training complete for {model_name} in {total_time:.1f}s.")
+    print(f"Best checkpoint saved to: {ckpt_path}")
     print(f"Training history saved to: {history_path}")
     return model, history_path
 

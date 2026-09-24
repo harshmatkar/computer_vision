@@ -1,0 +1,7 @@
+image_name,model,inference_time_sec,model_num_parameters,peripheral_enrichment_ratio,membrane_coverage_continuity_pct,radial_accumulation_thickness_px,spatial_polarity_index_magnitude,spatial_polarity_index_angle_deg,dice_vs_label,f1_vs_label,iou_vs_label
+1.tif,unetpp,5.9582507610321045,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
+2.tif,unetpp,0.21469664573669434,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
+3.tif,unetpp,0.21601152420043945,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
+4.tif,unetpp,0.26374125480651855,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
+5.tif,unetpp,0.20726561546325684,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
+6.tif,unetpp,0.21768593788146973,285501,nan,nan,nan,nan,nan,1.0,1.0,1.0
