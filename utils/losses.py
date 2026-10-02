@@ -1,184 +1,265 @@
 """
 utils/losses.py
------------------
-All loss functions used across the three team-member models, in one place
-so train.py can select the right one via config.MODEL_REGISTRY without
-duplicating math in multiple files. Implemented as tf.keras-compatible
-loss functions: each takes (y_true, y_pred_logits) and returns a scalar
-Tensor, matching the signature Keras expects for `model.compile(loss=...)`.
+---------------
+Loss functions and metrics for all three models.
 
-  - Member A (Lightweight UNet++)  -> bce_dice_loss
-  - Member B (Attention U-Net)     -> tversky_loss
-  - Member C (ResUNet++)           -> combo_loss
+WHY THE OLD BCE+DICE FAILED
+----------------------------
+Plain binary cross-entropy with 1-5% foreground gives the model an easy
+shortcut: predict all-zeros, get near-zero BCE, and watch the combined
+loss plateau. At 99% background the BCE gradient is 99x larger from
+background pixels than foreground. The 0.5-weighted Dice term cannot
+overcome this imbalance, so EarlyStopping fires at epoch 0 (the best
+the model ever achieves) and training halts having learned nothing.
 
-All three operate on raw (pre-sigmoid) logits plus a binary {0,1} target
-mask, matching the output convention of all three model files (no final
-activation on the output Conv2D layer).
+FIXES
+------
+  UNet++  "bce_dice" -> Focal + Dice
+      Focal loss (Lin et al., 2017) down-weights easy negatives via
+      (1-p)^gamma, eliminating the all-zeros shortcut. alpha=0.75
+      further boosts the foreground gradient.
+
+  Attention UNet  "tversky" -> Focal Tversky
+      Tversky index lets you penalise FN and FP unequally.
+      For sparse foreground you need beta >> alpha (high FN penalty).
+      The config originally had alpha=0.7 (high FP penalty) -- wrong
+      direction. Fixed in config: TVERSKY_ALPHA=0.3, TVERSKY_BETA=0.7.
+
+  ResUNet++  "combo" -> Weighted-CE + Dice
+      Weighted cross-entropy with pos_weight drives the CE term to
+      explicitly treat foreground pixels as POS_WEIGHT times more
+      important than background. Combined with Dice for spatial overlap.
+
+All loss functions accept RAW LOGITS (no sigmoid applied before calling).
+All functions are numerically stable (use tf.nn for CE operations).
 """
 
 import tensorflow as tf
 
-EPS = 1e-6
 
+# ============================================================
+# SHARED PRIMITIVES
+# ============================================================
 
-def dice_coefficient(y_true: tf.Tensor, y_pred_logits: tf.Tensor, eps: float = EPS) -> tf.Tensor:
+def _soft_dice(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
+               smooth: float = 1e-6) -> tf.Tensor:
     """
-    Sorensen-Dice coefficient between a predicted probability map
-    (post-sigmoid) and a binary target mask. Dice = 2*|A∩B| / (|A|+|B|).
+    Soft (probabilistic) Dice computed from logits.
+
+    Flattens the batch dimension so Dice is computed globally across
+    all pixels and images in the batch -- this is slightly more stable
+    than per-image averaging when images are sparsely labelled.
     """
-    y_pred = tf.sigmoid(y_pred_logits)
-    y_true_flat = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
-    y_pred_flat = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
+    y_pred_prob = tf.sigmoid(y_pred_logits)
+    y_true_f    = tf.cast(tf.reshape(y_true,           [-1]), tf.float32)
+    y_pred_f    = tf.reshape(y_pred_prob, [-1])
 
-    intersection = tf.reduce_sum(y_true_flat * y_pred_flat, axis=1)
-    union = tf.reduce_sum(y_true_flat, axis=1) + tf.reduce_sum(y_pred_flat, axis=1)
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    union        = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f)
 
-    dice = (2.0 * intersection + eps) / (union + eps)
-    return tf.reduce_mean(dice)
-
-
-def dice_loss(y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
-    """Dice loss = 1 - Dice coefficient (to be minimized)."""
-    return 1.0 - dice_coefficient(y_true, y_pred_logits)
+    return (2.0 * intersection + smooth) / (union + smooth)
 
 
-# ---------------------------------------------------------------------------
-# Member A: Combined BCE + Dice Loss
-# ---------------------------------------------------------------------------
-def make_bce_dice_loss(bce_weight: float = 0.5, dice_weight: float = 0.5):
+def dice_metric(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     """
-    Returns a loss_fn(y_true, y_pred_logits) computing:
-        total_loss = bce_weight * BinaryCrossentropy + dice_weight * DiceLoss
+    Dice coefficient from logits -- used as a Keras metric in compile().
 
-    Balances per-pixel classification (BCE) with region-overlap quality
-    (Dice), which is the standard choice for the UNet++ baseline.
+    Named 'dice_metric' and imported by model_builder.build_and_compile().
+    Keras will display it as 'dice_metric' in logs and in the training-
+    history CSV.
     """
-    bce_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-
-    def loss_fn(y_true, y_pred_logits):
-        bce = bce_fn(y_true, y_pred_logits)
-        d_loss = dice_loss(y_true, y_pred_logits)
-        return bce_weight * bce + dice_weight * d_loss
-
-    return loss_fn
+    return _soft_dice(y_true, y_pred)
 
 
-# ---------------------------------------------------------------------------
-# Member B: Tversky Loss  (Salehi, Erdogmus & Gholipour, MLMI 2017)
-# ---------------------------------------------------------------------------
-def tversky_index(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
-                   alpha: float = 0.7, beta: float = 0.3, eps: float = EPS) -> tf.Tensor:
+# ============================================================
+# 1. FOCAL + DICE  (UNet++ -- "bce_dice" in registry)
+# ============================================================
+
+def _focal_loss(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
+                gamma: float = 2.0, alpha: float = 0.75) -> tf.Tensor:
     """
-    Tversky index generalizes Dice by letting false positives (alpha) and
-    false negatives (beta) be weighted independently:
+    Sigmoid focal loss (numerically stable via tf.nn).
 
-        TI = TP / (TP + alpha*FP + beta*FN)
-
-    alpha=beta=0.5 recovers the standard Dice coefficient. Here alpha=0.7 >
-    beta=0.3 (config.TVERSKY_ALPHA / TVERSKY_BETA) slightly favors recall
-    by penalizing false negatives less aggressively relative to false
-    positives -- useful for the thin, sparse actin-edge masks where missing
-    real edge pixels is worse than a few extra false positives.
+    gamma : focusing parameter -- higher values suppress easy negatives
+            more aggressively (2.0 is the standard; 2-3 for very sparse
+            foreground).
+    alpha : foreground class weight.
+            alpha=0.75 means foreground pixels get 3x the base gradient
+            weight of background pixels, on top of the focal weighting.
+            (Standard RetinaNet uses 0.25 for 50%-ish foreground;
+             we flip to 0.75 because our foreground is < 5%.)
     """
-    y_pred = tf.sigmoid(y_pred_logits)
-    y_true_flat = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
-    y_pred_flat = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
+    y_true = tf.cast(y_true, tf.float32)
 
-    tp = tf.reduce_sum(y_true_flat * y_pred_flat, axis=1)
-    fp = tf.reduce_sum((1 - y_true_flat) * y_pred_flat, axis=1)
-    fn = tf.reduce_sum(y_true_flat * (1 - y_pred_flat), axis=1)
-
-    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
-    return tf.reduce_mean(tversky)
-
-
-def make_tversky_loss(alpha: float = 0.7, beta: float = 0.3):
-    """Returns a loss_fn(y_true, y_pred_logits) = 1 - Tversky index."""
-
-    def loss_fn(y_true, y_pred_logits):
-        return 1.0 - tversky_index(y_true, y_pred_logits, alpha=alpha, beta=beta)
-
-    return loss_fn
-
-
-# ---------------------------------------------------------------------------
-# Member C: Combo Loss  (Taghanaki et al., 2019 -
-#            "Combo loss: Handling input and output imbalance in
-#             multi-organ segmentation")
-# ---------------------------------------------------------------------------
-def weighted_bce(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
-                  ce_beta: float = 0.5, eps: float = EPS) -> tf.Tensor:
-    """
-    Weighted binary cross-entropy where the positive (foreground) class is
-    weighted by `ce_beta` and the negative (background) class by
-    `(1 - ce_beta)`. With ce_beta > 0.5, false negatives on the (rare)
-    foreground actin-edge pixels are penalized more heavily than false
-    positives on background -- addressing the same foreground/background
-    imbalance problem that motivates Tversky loss, but from a
-    cross-entropy-weighting angle rather than a Dice-generalization angle.
-    """
-    y_pred = tf.clip_by_value(tf.sigmoid(y_pred_logits), eps, 1 - eps)
-    y_true_flat = tf.reshape(y_true, [-1])
-    y_pred_flat = tf.reshape(y_pred, [-1])
-
-    loss = -(
-        ce_beta * y_true_flat * tf.math.log(y_pred_flat)
-        + (1 - ce_beta) * (1 - y_true_flat) * tf.math.log(1 - y_pred_flat)
+    # BCE from logits -- numerically stable
+    bce = tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=y_true, logits=y_pred_logits
     )
-    return tf.reduce_mean(loss)
+
+    y_pred_prob = tf.sigmoid(y_pred_logits)
+
+    # p_t: predicted probability of the true class
+    p_t = y_true * y_pred_prob + (1.0 - y_true) * (1.0 - y_pred_prob)
+    p_t = tf.clip_by_value(p_t, 1e-7, 1.0)
+
+    # alpha_t: per-pixel class weight
+    alpha_t = y_true * alpha + (1.0 - y_true) * (1.0 - alpha)
+
+    # Focal modulation
+    focal_weight = alpha_t * tf.pow(1.0 - p_t, gamma)
+
+    return tf.reduce_mean(focal_weight * bce)
 
 
-def make_combo_loss(alpha: float = 0.5, ce_beta: float = 0.5):
+def focal_dice_loss(y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
     """
-    Returns a loss_fn(y_true, y_pred_logits) computing:
-        Combo Loss = alpha * Weighted-BCE + (1 - alpha) * Dice Loss
+    0.5 * Focal(alpha=0.75, gamma=2) + 0.5 * (1 - SoftDice)
 
-    Distinct from bce_dice_loss (Member A) because the cross-entropy term
-    here is class-weighted (ce_beta) rather than plain BCE, giving Member C
-    an independently-tunable third objective function as required by the
-    "each member uses a different network AND different loss" rubric line.
+    Replaces the old plain BCE + Dice that collapsed to all-zeros on
+    sparse foreground. The focal term eliminates the easy-negative
+    shortcut; the Dice term ensures spatial coverage is optimised.
     """
-
-    def loss_fn(y_true, y_pred_logits):
-        wbce = weighted_bce(y_true, y_pred_logits, ce_beta=ce_beta)
-        d_loss = dice_loss(y_true, y_pred_logits)
-        return alpha * wbce + (1 - alpha) * d_loss
-
-    return loss_fn
+    focal = _focal_loss(y_true, y_pred_logits, gamma=2.0, alpha=0.75)
+    dice  = 1.0 - _soft_dice(y_true, y_pred_logits)
+    return 0.5 * focal + 0.5 * dice
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher used by train.py / evaluate.py
-# ---------------------------------------------------------------------------
-def get_loss_fn(loss_name: str, config_module):
+# ============================================================
+# 2. FOCAL TVERSKY  (Attention UNet -- "tversky" in registry)
+# ============================================================
+
+def _tversky_index(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
+                   alpha: float, beta: float,
+                   smooth: float = 1e-6) -> tf.Tensor:
     """
-    Returns a callable loss_fn(y_true, y_pred_logits) -> scalar tensor,
-    configured with the hyperparameters for the requested loss name.
+    Tversky similarity index.
 
-    Parameters
-    ----------
-    loss_name : str
-        One of: 'bce_dice', 'tversky', 'combo'.
-    config_module : module
-        The imported config.py module (passed explicitly to avoid a
-        circular import between losses.py and config.py).
+    TI = TP / (TP + alpha*FP + beta*FN)
+
+    alpha : penalty on false positives.
+    beta  : penalty on false negatives.
+
+    For sparse foreground (rare actin pixels) you want beta >> alpha:
+    missing a true actin pixel (FN) should cost more than including a
+    false one (FP). Config v4 sets TVERSKY_ALPHA=0.3, TVERSKY_BETA=0.7.
+    """
+    y_pred_prob = tf.sigmoid(y_pred_logits)
+    y_true_f    = tf.cast(tf.reshape(y_true,           [-1]), tf.float32)
+    y_pred_f    = tf.reshape(y_pred_prob, [-1])
+
+    tp = tf.reduce_sum(y_true_f * y_pred_f)
+    fp = tf.reduce_sum((1.0 - y_true_f) * y_pred_f)
+    fn = tf.reduce_sum(y_true_f * (1.0 - y_pred_f))
+
+    return (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+
+
+def focal_tversky_loss(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
+                       alpha: float, beta: float,
+                       gamma: float = 0.75) -> tf.Tensor:
+    """
+    Focal Tversky Loss (Abraham & Khan, 2019).
+
+    FTL = (1 - TI)^gamma
+
+    gamma < 1 emphasises hard examples (small or broken actin regions)
+    more than standard Tversky. gamma=0.75 is standard for medical
+    segmentation.
+    """
+    ti = _tversky_index(y_true, y_pred_logits, alpha, beta)
+    return tf.pow(tf.clip_by_value(1.0 - ti, 1e-7, 1.0), gamma)
+
+
+# ============================================================
+# 3. WEIGHTED-CE + DICE  (ResUNet++ -- "combo" in registry)
+# ============================================================
+
+def combo_loss(y_true: tf.Tensor, y_pred_logits: tf.Tensor,
+               alpha: float, pos_weight: float) -> tf.Tensor:
+    """
+    alpha * WeightedCE + (1 - alpha) * (1 - SoftDice)
+
+    pos_weight : multiplicative upweight for foreground pixels in the CE
+                 term.  Derived from config.COMBO_CE_BETA (see get_loss_fn):
+                 a beta of 0.9 maps to pos_weight = (1-0.9)/0.9 * 9 ≈ 10,
+                 meaning foreground pixels are weighted 10x in the CE loss.
+                 Adjust COMBO_CE_BETA in config to tune aggressiveness.
+
+    tf.nn.weighted_cross_entropy_with_logits is numerically stable and
+    handles the pos_weight scaling internally.
+    """
+    y_true_cast = tf.cast(y_true, tf.float32)
+
+    wce = tf.reduce_mean(
+        tf.nn.weighted_cross_entropy_with_logits(
+            labels=y_true_cast,
+            logits=y_pred_logits,
+            pos_weight=pos_weight,
+        )
+    )
+    dice = 1.0 - _soft_dice(y_true, y_pred_logits)
+
+    return alpha * wce + (1.0 - alpha) * dice
+
+
+# ============================================================
+# FACTORY
+# ============================================================
+
+def get_loss_fn(loss_name: str, config):
+    """
+    Returns a compiled loss function (y_true, y_pred_logits) -> scalar.
+
+    Called by model_builder.build_and_compile() once per model.
+
+    loss_name   model           loss used
+    ---------   -----           ---------
+    bce_dice    UNet++          Focal + Dice
+    tversky     Attention UNet  Focal Tversky
+    combo       ResUNet++       Weighted-CE + Dice
     """
     if loss_name == "bce_dice":
-        return make_bce_dice_loss(bce_weight=config_module.BCE_WEIGHT,
-                                   dice_weight=config_module.DICE_WEIGHT)
+        # UNet++: Focal + Dice
+        # (replaces plain BCE + Dice which collapsed to all-zeros)
+        def _loss(y_true, y_pred):
+            return focal_dice_loss(y_true, y_pred)
+        _loss.__name__ = "focal_dice_loss"
+        return _loss
+
     elif loss_name == "tversky":
-        return make_tversky_loss(alpha=config_module.TVERSKY_ALPHA,
-                                  beta=config_module.TVERSKY_BETA)
+        # Attention UNet: Focal Tversky
+        # config.TVERSKY_ALPHA = 0.3 (low FP penalty)
+        # config.TVERSKY_BETA  = 0.7 (high FN penalty -- corrected from 0.3)
+        alpha = config.TVERSKY_ALPHA
+        beta  = config.TVERSKY_BETA
+
+        def _loss(y_true, y_pred):
+            return focal_tversky_loss(y_true, y_pred, alpha=alpha, beta=beta)
+        _loss.__name__ = "focal_tversky_loss"
+        return _loss
+
     elif loss_name == "combo":
-        return make_combo_loss(alpha=config_module.COMBO_ALPHA,
-                                ce_beta=config_module.COMBO_CE_BETA)
+        # ResUNet++: Weighted-CE + Dice
+        # pos_weight derived from COMBO_CE_BETA:
+        #   beta = foreground target fraction (e.g. 0.9 means "treat foreground
+        #          as 90% of the loss budget regardless of pixel count")
+        #   pos_weight = (1 - beta) / beta * normalisation
+        #   With beta=0.9: pos_weight = 0.1 / 0.9 * 9 ≈ 1... too low.
+        #   We use pos_weight directly = 1/beta - 1 mapped to a useful range:
+        #   beta=0.9 -> pos_weight = (0.9 / 0.1) = 9
+        #   This upweights foreground 9x in the CE term.
+        beta       = config.COMBO_CE_BETA       # expected ~0.9
+        pos_weight = beta / max(1.0 - beta, 1e-6)   # ~9 for beta=0.9
+        pos_weight = float(tf.clip_by_value(pos_weight, 1.0, 100.0))
+        alpha      = config.COMBO_ALPHA
+
+        def _loss(y_true, y_pred):
+            return combo_loss(y_true, y_pred, alpha=alpha, pos_weight=pos_weight)
+        _loss.__name__ = "combo_loss"
+        return _loss
+
     else:
-        raise ValueError(f"Unknown loss_name: {loss_name!r}. Expected 'bce_dice', 'tversky', or 'combo'.")
-
-
-# ---------------------------------------------------------------------------
-# Keras Metric wrapper so Dice can be tracked during model.fit()
-# ---------------------------------------------------------------------------
-def dice_metric(y_true, y_pred_logits):
-    """A plain function usable directly in `model.compile(metrics=[...])`."""
-    return dice_coefficient(y_true, y_pred_logits)
+        raise ValueError(
+            f"Unknown loss_name {loss_name!r}. "
+            f"Expected one of: 'bce_dice', 'tversky', 'combo'."
+        )
