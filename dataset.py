@@ -13,6 +13,37 @@ Handles:
        augmentation that multiplies effective dataset size by
        config.AUGMENT_REPEATS (default 20) per epoch.
 
+CHANGELOG (cell source):
+    - New config.CELL_SOURCE selects where the statement labeler gets its
+      CELLS from:
+        "classical" -> Otsu footprint + watershed (previous behaviour)
+        "microsam"  -> cell-label images produced offline by
+                       generate_microsam_cells.py (micro_sam, Archit et al.
+                       2025) and stored in config.CELLS_DIR as
+                       <image stem>_cells.tif
+      Only matters when LABEL_MODE is "statement" or "union". The Frangi
+      label is never affected.
+    - preprocess_image(img, cells=None, path=None): cells are taken from
+      (1) the `cells` argument, else (2) the file matching `path`, else
+      (3) the file whose raw image matches `img` (a content fingerprint, so
+      loocv.py / evaluate.py / notebooks that call preprocess_image(img)
+      without a path stay consistent with training). If CELL_SOURCE is
+      "microsam" and no cells can be found a clear error is raised -
+      it NEVER silently falls back to classical cells.
+
+CHANGELOG (label modes):
+    - New config.LABEL_MODE selects what the CNN is trained on:
+        "frangi"    -> Frangi ridge labels only (previous behaviour, unchanged)
+        "statement" -> problem-statement labels only (label_statement.py:
+                       Gaussian -> Otsu -> per-cell erosion bands -> HOG +
+                       targeted intensity threshold)
+        "union"     -> pixel-wise OR of both
+    - preprocess_image() still returns every Frangi key it always did, plus
+      "label_mode", "mask_frangi" and (when computed) "mask_statement".
+      "edge_mask" is the FINAL label for the selected mode, so train.py,
+      loocv.py, evaluate.py and the notebooks all follow LABEL_MODE
+      automatically.
+
 CHANGELOG (augmentation fix):
     - Added _tf_augment(): applies random geometric (flip, rot90) and
       photometric (brightness, contrast, noise) transforms.  Geometric
@@ -28,6 +59,7 @@ CHANGELOG (augmentation fix):
 
 import os
 import glob
+import threading
 
 import numpy as np
 import cv2
@@ -38,6 +70,9 @@ from skimage.morphology import remove_small_objects
 
 import config
 from utils.hog_processing import extract_hog_features
+from label_statement import label_image as _statement_label_image
+from label_statement import Params as _StatementParams
+from label_statement import load_cells_file as _load_cells_file
 
 
 # ============================================================
@@ -64,11 +99,123 @@ def load_tif_image(path: str) -> np.ndarray:
     return arr.astype(np.float32)
 
 
+def _statement_mask(img: np.ndarray, cells=None) -> np.ndarray:
+    """
+    Problem-statement label (label_statement.py) for one normalised image
+    already at config.IMAGE_SIZE. Parameters default to
+    label_statement.Params; override any of them via config.STATEMENT_PARAMS.
+    `cells`: optional external cell-label image (see get_external_cells).
+    """
+    params = _StatementParams(
+        image_size=tuple(config.IMAGE_SIZE),
+        **getattr(config, "STATEMENT_PARAMS", {}),
+    )
+    return _statement_label_image(img, params, cells=cells)["mask"].astype(np.uint8)
+
+
+# ------------------------------------------------------------
+# External cell masks (config.CELL_SOURCE = "microsam")
+# ------------------------------------------------------------
+_CELL_EXTS = (".tif", ".tiff", ".png", ".npy")
+_FP_TOL = 0.03          # max |difference| between 16x16 fingerprints to call two images "the same"
+_registry_lock = threading.Lock()
+_registry = None        # list of (stem, fingerprint), built lazily from config.RAW_IMAGE_DIR
+
+
+def _cells_dir() -> str:
+    return getattr(config, "CELLS_DIR", os.path.join(config.DATA_DIR, "cells_microsam"))
+
+
+def cells_file_for(stem: str):
+    """Path of the cell-label file for an image stem, or None if there is none."""
+    for ext in _CELL_EXTS:
+        cand = os.path.join(_cells_dir(), f"{stem}_cells{ext}")
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _missing_cells_message(stems) -> str:
+    return (
+        f"config.CELL_SOURCE is 'microsam' but no cell-label file was found in "
+        f"{_cells_dir()} for: {sorted(stems)}.\n"
+        f"Expected <image stem>_cells.tif (also .tiff/.png/.npy). Generate them with "
+        f"generate_microsam_cells.py (in an environment that has micro_sam), or set "
+        f"config.CELL_SOURCE = 'classical'."
+    )
+
+
+def _fingerprint(img: np.ndarray) -> np.ndarray:
+    """16x16 area-averaged copy of a [0,1] image: tiny, and insensitive to the
+    interpolation used to resize it."""
+    return cv2.resize(img.astype(np.float32), (16, 16),
+                      interpolation=cv2.INTER_AREA).ravel()
+
+
+def _get_registry():
+    global _registry
+    with _registry_lock:
+        if _registry is None:
+            reg = []
+            for p in get_image_paths():
+                im = cv2.resize(load_tif_image(p), config.IMAGE_SIZE,
+                                interpolation=cv2.INTER_LINEAR)
+                reg.append((os.path.splitext(os.path.basename(p))[0], _fingerprint(im)))
+            _registry = reg
+        return _registry
+
+
+def _stem_for_image(img: np.ndarray):
+    """Identify which raw image `img` is, by content. Returns a stem or None."""
+    fp = _fingerprint(img)
+    diffs = sorted((float(np.max(np.abs(fp - f))), stem) for stem, f in _get_registry())
+    if not diffs or diffs[0][0] > _FP_TOL:
+        return None
+    if len(diffs) > 1 and diffs[1][0] < diffs[0][0] + _FP_TOL:
+        return None                      # ambiguous (near-duplicate images)
+    return diffs[0][1]
+
+
+def get_external_cells(img: np.ndarray = None, path: str = None) -> np.ndarray:
+    """
+    Cell-label image for one raw image, from config.CELLS_DIR.
+    Identify the image by `path` if given, otherwise by the content of `img`.
+    Raises (never falls back) when it cannot be found.
+    """
+    if path is not None:
+        stem = os.path.splitext(os.path.basename(path))[0]
+    else:
+        stem = _stem_for_image(img)
+        if stem is None:
+            raise RuntimeError(
+                "CELL_SOURCE is 'microsam' but this image could not be matched to any "
+                f"file in {config.RAW_IMAGE_DIR}, so its cell mask is unknown. "
+                "Pass path=... to preprocess_image(), or use an image from data/raw."
+            )
+    f = cells_file_for(stem)
+    if f is None:
+        raise FileNotFoundError(_missing_cells_message([stem]))
+    return _load_cells_file(f)
+
+
+def _uses_external_cells() -> bool:
+    return (getattr(config, "CELL_SOURCE", "classical") == "microsam"
+            and getattr(config, "LABEL_MODE", "frangi") in ("statement", "union"))
+
+
+def check_external_cells(paths) -> None:
+    """Fail fast (before any training starts) if any image lacks a cell file."""
+    missing = [os.path.splitext(os.path.basename(p))[0] for p in paths
+               if cells_file_for(os.path.splitext(os.path.basename(p))[0]) is None]
+    if missing:
+        raise FileNotFoundError(_missing_cells_message(missing))
+
+
 # ============================================================
 # 2. FRANGI-BASED LABELING PIPELINE
 # ============================================================
 
-def preprocess_image(img: np.ndarray) -> dict:
+def preprocess_image(img: np.ndarray, cells=None, path: str = None) -> dict:
     """
     Generate a binary actin-edge label from one normalized image
     using a Frangi vesselness filter.
@@ -160,6 +307,33 @@ def preprocess_image(img: np.ndarray) -> dict:
         edge_mask = frangi_binary.copy()
 
     # ----------------------------------------------------------
+    # Label mode: choose which classical label the CNN learns from.
+    #   frangi    : the Frangi/HOG mask computed above (unchanged)
+    #   statement : label_statement.py (problem-statement pipeline)
+    #   union     : pixel-wise OR of the two
+    # ----------------------------------------------------------
+    label_mode = getattr(config, "LABEL_MODE", "frangi")
+    if label_mode not in ("frangi", "statement", "union"):
+        raise ValueError(
+            f"config.LABEL_MODE must be 'frangi', 'statement' or 'union', "
+            f"got {label_mode!r}"
+        )
+
+    mask_frangi = edge_mask.copy()
+    mask_statement = None
+    cell_source = None
+    if label_mode in ("statement", "union"):
+        ext_cells = cells
+        if ext_cells is None and getattr(config, "CELL_SOURCE", "classical") == "microsam":
+            ext_cells = get_external_cells(img, path=path)
+        mask_statement = _statement_mask(img, cells=ext_cells)
+        cell_source = "external" if ext_cells is not None else "classical"
+        if label_mode == "statement":
+            edge_mask = mask_statement
+        else:
+            edge_mask = ((mask_frangi > 0) | (mask_statement > 0)).astype(np.uint8)
+
+    # ----------------------------------------------------------
     # Footprint: dilated actin mask used as cell-region proxy
     # for biophysical metrics.
     # ----------------------------------------------------------
@@ -176,6 +350,10 @@ def preprocess_image(img: np.ndarray) -> dict:
         "hog_weight_map": hog_weight_map,
         "edge_mask":      edge_mask,
         "footprint":      footprint,
+        "label_mode":     label_mode,
+        "cell_source":    cell_source,
+        "mask_frangi":    mask_frangi,
+        **({"mask_statement": mask_statement} if mask_statement is not None else {}),
     }
 
 
@@ -196,7 +374,7 @@ def _load_and_label_numpy(path_bytes) -> tuple:
         img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
     )
 
-    processed = preprocess_image(img_resized)
+    processed = preprocess_image(img_resized, path=path)
     mask      = processed["edge_mask"].astype(np.float32)
 
     image_arr = img_resized[..., np.newaxis].astype(np.float32)  # (H,W,1)
@@ -357,6 +535,8 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
     seed       = config.RANDOM_SEED  if seed       is None else seed
 
     paths   = get_image_paths()
+    if _uses_external_cells():
+        check_external_cells(paths)
     n_total = len(paths)
     if n_total < 2:
         raise RuntimeError("At least 2 images required for train/val split.")

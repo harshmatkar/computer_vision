@@ -44,6 +44,23 @@ CHANGELOG (model-training fix):
             converge rather than overshooting or stopping too early.
             ReduceLROnPlateau in train.py will halve it automatically if
             val dice plateaus.
+
+    Label mode (problem-statement labeling):
+        LABEL_MODE  [NEW]  "union" (default) | "frangi" | "statement"
+            Chooses which classical label the CNNs are trained on.
+            "frangi" reproduces the previous behaviour exactly.
+            "statement" uses label_statement.py (Gaussian -> Otsu ->
+            per-cell erosion bands -> HOG + targeted intensity threshold).
+            "union" is the pixel-wise OR of the two.
+        STATEMENT_PARAMS  [NEW]  optional overrides for label_statement.Params.
+
+    Cell source (foundation-model cells):
+        CELL_SOURCE  [NEW]  "classical" (default) | "microsam"
+            Where the statement labeler gets its cells from. "microsam" uses
+            cell-label images made offline by generate_microsam_cells.py and
+            stored in CELLS_DIR as <image stem>_cells.tif. Only matters when
+            LABEL_MODE is "statement" or "union".
+        CELLS_DIR    [NEW]  folder holding those cell-label images.
 """
 
 import os
@@ -99,6 +116,31 @@ HOG_ORIENTATIONS    = 9
 HOG_PIXELS_PER_CELL = (8, 8)
 HOG_CELLS_PER_BLOCK = (2, 2)
 HOG_BLOCK_NORM      = "L2-Hys"
+
+# ---------------------------------------------------------------------------
+# LABEL MODE  (which classical label the CNNs learn from)
+# ---------------------------------------------------------------------------
+#   "frangi"    : Frangi ridge labels only            (previous behaviour)
+#   "statement" : problem-statement labels only       (label_statement.py)
+#   "union"     : pixel-wise OR of both (covers cell edges AND junctions)
+# Every consumer (train.py, loocv.py, evaluate.py, notebooks) goes through
+# dataset.preprocess_image(), so changing this one line changes them all.
+LABEL_MODE = "union"
+
+# Optional overrides for label_statement.Params, e.g.
+#   STATEMENT_PARAMS = dict(cell_marker_h=0.008, band_radius_outer_px=10)
+# Empty dict = use the defaults tuned in label_statement.py.
+STATEMENT_PARAMS = {}
+
+# Where the statement labeler gets its CELLS from (only used when LABEL_MODE is
+# "statement" or "union"):
+#   "classical" : Otsu footprint + watershed          (default, no extra files)
+#   "microsam"  : foundation-model cells from micro_sam, produced offline by
+#                 generate_microsam_cells.py -> <CELLS_DIR>/<image stem>_cells.tif
+# With "microsam", a missing cell file raises an error; it never silently
+# falls back to classical cells.
+CELL_SOURCE = "classical"
+CELLS_DIR = os.path.join(DATA_DIR, "cells_microsam")
 
 # ---------------------------------------------------------------------------
 # DATA AUGMENTATION

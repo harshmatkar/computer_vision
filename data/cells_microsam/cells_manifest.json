@@ -1,0 +1,84 @@
+{
+  "_run": {
+    "micro_sam_version": "1.8.14",
+    "model": "vit_b_lm",
+    "mode": "auto",
+    "segmenter": "InstanceSegmentationWithDecoder",
+    "generate_kwargs": {
+      "center_distance_threshold": 0.4,
+      "boundary_distance_threshold": 0.5
+    },
+    "clip_percentiles": [
+      0.5,
+      99.8
+    ],
+    "min_cell_px": 50,
+    "date": "2026-10-17 08:45:22"
+  },
+  "1": {
+    "n_cells": 111,
+    "foreground_percent": 58.34,
+    "median_cell_area_px": 4652,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 4.0,
+    "warnings": []
+  },
+  "2": {
+    "n_cells": 139,
+    "foreground_percent": 72.58,
+    "median_cell_area_px": 5026,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 3.1,
+    "warnings": []
+  },
+  "3": {
+    "n_cells": 86,
+    "foreground_percent": 61.36,
+    "median_cell_area_px": 7129,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 2.6,
+    "warnings": []
+  },
+  "4": {
+    "n_cells": 51,
+    "foreground_percent": 38.5,
+    "median_cell_area_px": 6858,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 2.5,
+    "warnings": []
+  },
+  "5": {
+    "n_cells": 17,
+    "foreground_percent": 13.2,
+    "median_cell_area_px": 6862,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 2.4,
+    "warnings": []
+  },
+  "6": {
+    "n_cells": 24,
+    "foreground_percent": 18.77,
+    "median_cell_area_px": 6686,
+    "shape": [
+      1024,
+      1024
+    ],
+    "seconds": 2.4,
+    "warnings": []
+  }
+}
