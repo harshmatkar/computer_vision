@@ -160,3 +160,32 @@ def compute_all_metrics(image, footprint, edge_mask,
         "spatial_polarity_index_magnitude":   spi["spi_magnitude"],
         "spatial_polarity_index_angle_deg":   spi["spi_angle_degrees"],
     }
+
+def compute_metrics(pred: np.ndarray, label: np.ndarray, eps: float = 1e-6) -> dict:
+    """
+    Compute Dice, F1, IoU, Precision, Recall between a predicted binary
+    mask and a reference binary mask (the Frangi-HOG auto-label).
+    """
+    p = pred.astype(bool).flatten()
+    g = label.astype(bool).flatten()
+
+    tp = np.sum(p & g)
+    fp = np.sum(p & ~g)
+    fn = np.sum(~p & g)
+
+    precision = (tp + eps) / (tp + fp + eps)
+    recall    = (tp + eps) / (tp + fn + eps)
+    f1        = (2 * precision * recall) / (precision + recall + eps)
+    dice      = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+    iou       = (tp + eps) / (tp + fp + fn + eps)
+
+    return {
+        "dice":      float(dice),
+        "f1":        float(f1),
+        "iou":       float(iou),
+        "precision": float(precision),
+        "recall":    float(recall),
+        "tp":        int(tp),
+        "fp":        int(fp),
+        "fn":        int(fn),
+    }

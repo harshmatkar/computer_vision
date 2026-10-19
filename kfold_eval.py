@@ -41,11 +41,9 @@ import numpy as np
 import cv2
 import tensorflow as tf
 import matplotlib
-matplotlib.use("Agg")          # non-interactive backend, safe on headless servers
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# ── Make sure the project root is importable ─────────────────────────────
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -53,25 +51,16 @@ if ROOT not in sys.path:
 import config
 from dataset import load_tif_image, preprocess_image, get_image_paths
 from model_builder import is_multi_output
-
-
-# =========================================================================
-# HELPERS
-# =========================================================================
+from utils.metrics import compute_metrics
+from utils.ploting import _save_boxplot
 
 def load_model(model_name: str):
     """Load a trained .keras checkpoint for the given model name."""
-    ckpt_name = config.MODEL_REGISTRY[model_name]["checkpoint_name"]
-    ckpt_path = os.path.join(config.CHECKPOINT_DIR, ckpt_name)
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\n"
-            f"Run:  python train.py --model {model_name}"
-        )
+    ckpt_name = f"best_model_{model_name}"
+    ckpt_path = f"checkpoints/{ckpt_name}.keras"
     model = tf.keras.models.load_model(ckpt_path, compile=False)
     print(f"  Loaded  : {ckpt_path}  ({model.count_params():,} params)")
     return model
-
 
 def predict(model, model_name: str, img: np.ndarray) -> np.ndarray:
     """
@@ -85,41 +74,6 @@ def predict(model, model_name: str, img: np.ndarray) -> np.ndarray:
     prob    = tf.sigmoid(logits).numpy().squeeze()
     return (prob >= config.SEGMENTATION_PROB_THRESHOLD).astype(np.uint8)
 
-
-def compute_metrics(pred: np.ndarray, label: np.ndarray, eps: float = 1e-6) -> dict:
-    """
-    Compute Dice, F1, IoU, Precision, Recall between a predicted binary
-    mask and a reference binary mask (the Frangi-HOG auto-label).
-    """
-    p = pred.astype(bool).flatten()
-    g = label.astype(bool).flatten()
-
-    tp = np.sum(p & g)
-    fp = np.sum(p & ~g)
-    fn = np.sum(~p & g)
-
-    precision = (tp + eps) / (tp + fp + eps)
-    recall    = (tp + eps) / (tp + fn + eps)
-    f1        = (2 * precision * recall) / (precision + recall + eps)
-    dice      = (2 * tp + eps) / (2 * tp + fp + fn + eps)
-    iou       = (tp + eps) / (tp + fp + fn + eps)
-
-    return {
-        "dice":      float(dice),
-        "f1":        float(f1),
-        "iou":       float(iou),
-        "precision": float(precision),
-        "recall":    float(recall),
-        "tp":        int(tp),
-        "fp":        int(fp),
-        "fn":        int(fn),
-    }
-
-
-# =========================================================================
-# LOOCV
-# =========================================================================
-
 def run_loocv(model_name: str) -> pd.DataFrame:
     """
     Run Leave-One-Out CV for one model.
@@ -130,11 +84,11 @@ def run_loocv(model_name: str) -> pd.DataFrame:
         outputs/loocv_boxplot_<model_name>.png
     """
     print(f"\n{'='*60}")
-    print(f"LOOCV  →  {config.MODEL_REGISTRY[model_name]['display_name']}")
+    print(f"LOOCV  →  {model_name}")
     print(f"{'='*60}")
 
     model       = load_model(model_name)
-    image_paths = get_image_paths()
+    image_paths = get_image_paths("data/raw")
     N           = len(image_paths)
     print(f"  Images  : {N}  (each treated as held-out test once)\n")
 
@@ -142,21 +96,14 @@ def run_loocv(model_name: str) -> pd.DataFrame:
 
     for i, path in enumerate(image_paths):
         name = os.path.basename(path)
-
-        # ── Load & resize ─────────────────────────────────────────────
         raw = load_tif_image(path)
-        img = cv2.resize(
-            raw, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
-        )
+        img = cv2.resize(raw, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
 
-        # ── Generate Frangi label (reference) ─────────────────────────
         result = preprocess_image(img)
         label  = result["edge_mask"]
-
-        # ── CNN prediction ─────────────────────────────────────────────
+        
         pred = predict(model, model_name, img)
-
-        # ── Metrics ────────────────────────────────────────────────────
+        
         m = compute_metrics(pred, label)
 
         row = {
@@ -178,7 +125,6 @@ def run_loocv(model_name: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # ── Summary statistics ─────────────────────────────────────────────
     print(f"\n{'─'*60}")
     print(f"  LOOCV Summary  —  {model_name}")
     print(f"{'─'*60}")
@@ -193,88 +139,12 @@ def run_loocv(model_name: str) -> pd.DataFrame:
         )
     print(f"{'─'*60}\n")
 
-    # ── Save CSV ───────────────────────────────────────────────────────
-    csv_path = os.path.join(
-        config.OUTPUT_DIR, f"loocv_results_{model_name}.csv"
-    )
+    csv_path = os.path.join(config.OUTPUT_DIR, f"loocv_results_{model_name}.csv")
     df.to_csv(csv_path, index=False)
     print(f"  Results saved : {csv_path}")
-
-    # ── Box plot ───────────────────────────────────────────────────────
+    
     _save_boxplot(df, model_name)
-
     return df
-
-
-# =========================================================================
-# BOX PLOT
-# =========================================================================
-
-def _save_boxplot(df: pd.DataFrame, model_name: str):
-    """
-    Save a box-plot figure showing the distribution of Dice, F1, IoU,
-    Precision and Recall across LOOCV folds for one model.
-    """
-    metrics  = ["dice", "f1", "iou", "precision", "recall"]
-    data     = [df[m].values for m in metrics]
-    labels   = ["Dice", "F1", "IoU", "Precision", "Recall"]
-    colors   = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#F44336"]
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-
-    bps = ax.boxplot(
-        data,
-        patch_artist=True,
-        medianprops=dict(color="black", linewidth=2),
-        whiskerprops=dict(linewidth=1.4),
-        capprops=dict(linewidth=1.4),
-        flierprops=dict(marker="o", markersize=5, alpha=0.6),
-        widths=0.45,
-    )
-    for patch, color in zip(bps["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.75)
-
-    # Overlay individual data points (one dot per image/fold)
-    for i, vals in enumerate(data, start=1):
-        jitter = np.random.default_rng(42).uniform(-0.12, 0.12, len(vals))
-        ax.scatter(
-            np.full(len(vals), i) + jitter,
-            vals,
-            color="black",
-            s=30,
-            zorder=5,
-            alpha=0.8,
-            label="per-image score" if i == 1 else "",
-        )
-
-    ax.set_xticks(range(1, len(labels) + 1))
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.set_ylabel("Score", fontsize=12)
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_title(
-        f"LOOCV Results — {config.MODEL_REGISTRY[model_name]['display_name']}\n"
-        f"N={len(df)} images  │  "
-        f"Dice  {df['dice'].mean():.3f} ± {df['dice'].std():.3f}  │  "
-        f"F1  {df['f1'].mean():.3f} ± {df['f1'].std():.3f}  │  "
-        f"IoU  {df['iou'].mean():.3f} ± {df['iou'].std():.3f}",
-        fontsize=11,
-    )
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.legend(fontsize=9, loc="lower right")
-
-    plt.tight_layout()
-    plot_path = os.path.join(
-        config.OUTPUT_DIR, f"loocv_boxplot_{model_name}.png"
-    )
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Box plot saved: {plot_path}")
-
-
-# =========================================================================
-# ALL-MODELS COMPARISON BOX PLOT
-# =========================================================================
 
 def save_comparison_boxplot(all_dfs: dict):
     """
@@ -336,11 +206,6 @@ def save_comparison_boxplot(all_dfs: dict):
     plt.close()
     print(f"\n  Comparison plot saved: {path}")
 
-
-# =========================================================================
-# SUMMARY TABLE
-# =========================================================================
-
 def print_summary_table(all_dfs: dict):
     """Print a clean mean ± std table for all models and metrics."""
     metrics     = ["dice", "f1", "iou", "precision", "recall"]
@@ -379,13 +244,8 @@ def print_summary_table(all_dfs: dict):
     pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
     print(f"  Summary CSV saved: {summary_path}")
 
-
-# =========================================================================
-# MAIN
-# =========================================================================
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Leave-One-Out Cross-Validation evaluation.")
-    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices=list(config.MODEL_REGISTRY.keys()),)
+    parser = argparse.ArgumentParser(description="LOOCV evaluation.")
+    parser.add_argument("--model", type=str, default="unetpp",choices={"unetpp", "reunetpp", "attention_unet"})
     args = parser.parse_args()
     run_loocv(args.model)

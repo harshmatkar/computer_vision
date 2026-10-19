@@ -196,21 +196,6 @@ def print_benchmark_summary(all_results: dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate one or all of the three team-member models.")
-    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
-                         choices=list(config.MODEL_REGISTRY.keys()),
-                         help="Which model to evaluate.")
-    parser.add_argument("--all", action="store_true",
-                         help="Evaluate all three registered models and print a benchmark summary.")
+    parser.add_argument("--model", type=str, default="unetpp",choices={"unetpp", "reunetpp", "attention_unet"},)
     args = parser.parse_args()
-
-    if args.all:
-        results = {}
-        for name in config.MODEL_REGISTRY.keys():
-            try:
-                results[name] = evaluate_model(name)
-            except FileNotFoundError as e:
-                print(f"Skipping {name}: {e}")
-                results[name] = []
-        print_benchmark_summary(results)
-    else:
-        evaluate_model(args.model)
+    evaluate_model(args.model)
