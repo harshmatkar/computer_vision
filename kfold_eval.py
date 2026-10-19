@@ -385,31 +385,7 @@ def print_summary_table(all_dfs: dict):
 # =========================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Leave-One-Out Cross-Validation evaluation."
-    )
-    parser.add_argument(
-        "--model", type=str, default=config.DEFAULT_MODEL,
-        choices=list(config.MODEL_REGISTRY.keys()),
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="Run LOOCV for all three models and save a comparison plot.",
-    )
+    parser = argparse.ArgumentParser(description="Leave-One-Out Cross-Validation evaluation.")
+    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices=list(config.MODEL_REGISTRY.keys()),)
     args = parser.parse_args()
-
-    if args.all:
-        all_dfs = {}
-        for name in config.MODEL_REGISTRY.keys():
-            try:
-                all_dfs[name] = run_loocv(name)
-            except FileNotFoundError as e:
-                print(f"\n  Skipping {name}: {e}")
-
-        if len(all_dfs) > 1:
-            save_comparison_boxplot(all_dfs)
-
-        if all_dfs:
-            print_summary_table(all_dfs)
-    else:
-        run_loocv(args.model)
+    run_loocv(args.model)

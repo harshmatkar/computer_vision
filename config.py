@@ -57,21 +57,19 @@ DATA_DIR      = os.path.join(BASE_DIR, "data")
 RAW_IMAGE_DIR = os.path.join(DATA_DIR, "raw")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 OUTPUT_DIR    = os.path.join(BASE_DIR, "outputs")
-METRICS_CSV_PATH = os.path.join(OUTPUT_DIR, "actin_metrics.csv")
+# METRICS_CSV_PATH = os.path.join(OUTPUT_DIR, "actin_metrics.csv")
 
 for _d in (RAW_IMAGE_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# IMAGE PREPROCESSING
-# ---------------------------------------------------------------------------
-IMAGE_SIZE           = (256, 256)
-GAUSSIAN_KERNEL_SIZE = (3, 3)
-GAUSSIAN_SIGMA       = 1.0
 
-# ---------------------------------------------------------------------------
+# IMAGE PREPROCESSING
+# This tunes gaussian blurring function, in which pixel value is set to weighted average of its neibouring pixels.
+IMAGE_SIZE           = (256, 256)
+GAUSSIAN_KERNEL_SIZE = (3, 3) # Size of window that does averaging 
+GAUSSIAN_SIGMA       = 1.0 # width of bell curve in pixel larger --> Strong blur
+
 # FRANGI VESSELNESS FILTER
-# ---------------------------------------------------------------------------
 FRANGI_SIGMAS      = (1, 2, 3, 4, 5)   # detection scales in pixels
 FRANGI_BLACK_RIDGES = False             # detect BRIGHT ridges on dark bg
 FRANGI_ALPHA       = 0.5
@@ -81,10 +79,10 @@ FRANGI_BETA        = 0.5
 # Lowered 94 -> 90: gives ~3-5% foreground density instead of ~1%,
 # reducing the class-imbalance ratio the loss function must handle.
 # If masks look too noisy, raise back toward 93; if too sparse, lower to 87.
-FRANGI_THRESHOLD_PERCENTILE = 90
+FRANGI_THRESHOLD_PERCENTILE = 87
 
 # Remove binary blobs smaller than this area (px). 0 = disabled.
-FRANGI_MIN_COMPONENT_AREA = 10
+FRANGI_MIN_COMPONENT_AREA = 8
 
 # ---------------------------------------------------------------------------
 # HOG-GUIDED REFINEMENT
@@ -93,7 +91,7 @@ USE_HOG_REFINEMENT      = True
 HOG_REFINEMENT_WEIGHT   = 0.6
 # Lowered 0.35 -> 0.25: less aggressive filtering, retains more genuine
 # actin pixels that have moderate (not strong) directional gradient.
-HOG_REFINEMENT_THRESHOLD = 0.25
+HOG_REFINEMENT_THRESHOLD = 0.17
 
 HOG_ORIENTATIONS    = 9
 HOG_PIXELS_PER_CELL = (8, 8)
@@ -133,21 +131,15 @@ USE_DEEP_SUPERVISION = True
 
 MODEL_REGISTRY = {
     "unetpp": {
-        "display_name": "Lightweight UNet++ (Depthwise Separable Convs)",
         "loss": "bce_dice",
-        "checkpoint_name": "best_model_unetpp.keras",
         "metrics_csv_name": "actin_metrics_unetpp.csv",
     },
     "attention_unet": {
-        "display_name": "Attention U-Net",
         "loss": "tversky",
-        "checkpoint_name": "best_model_attention_unet.keras",
         "metrics_csv_name": "actin_metrics_attention_unet.csv",
     },
     "resunetpp": {
-        "display_name": "ResUNet++ (Residual + SE + ASPP)",
         "loss": "combo",
-        "checkpoint_name": "best_model_resunetpp.keras",
         "metrics_csv_name": "actin_metrics_resunetpp.csv",
     },
 }
@@ -158,8 +150,8 @@ DEFAULT_MODEL = "unetpp"
 # For sparse foreground: beta >> alpha (miss an actin pixel = costly).
 # Original: ALPHA=0.7, BETA=0.3 -- WRONG direction, penalised FP more.
 # Fixed:    ALPHA=0.3, BETA=0.7 -- correctly penalises missed foreground.
-TVERSKY_ALPHA = 0.3   # was 0.7
-TVERSKY_BETA  = 0.7   # was 0.3
+TVERSKY_ALPHA = 0.35   # was 0.7
+TVERSKY_BETA  = 0.65   # was 0.3
 
 # Combo loss (ResUNet++ / "combo")
 # COMBO_ALPHA     : balance between WCE and Dice terms (0.5 = equal)
@@ -168,7 +160,7 @@ TVERSKY_BETA  = 0.7   # was 0.3
 #                   beta=0.9 -> pos_weight≈9: foreground 9x more important.
 #                   beta=0.5 (old) -> pos_weight=1: unweighted, collapses.
 COMBO_ALPHA   = 0.5
-COMBO_CE_BETA = 0.9   # was 0.5
+COMBO_CE_BETA = 0.85   # was 0.5
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS
@@ -176,9 +168,6 @@ COMBO_CE_BETA = 0.9   # was 0.5
 GPU_AVAILABLE = len(tf.config.list_physical_devices("GPU")) > 0
 BATCH_SIZE    = 2
 
-# Increased from 50 -> 100: with augmentation producing 50 steps/epoch,
-# 100 epochs = 5000 gradient updates (vs 33 before). ReduceLROnPlateau
-# in train.py will keep LR appropriate throughout.
 NUM_EPOCHS    = 100
 
 # Reduced from 1e-3 -> 5e-4: lower starting LR prevents overshooting

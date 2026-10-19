@@ -83,20 +83,12 @@ def preprocess_image(img: np.ndarray) -> dict:
     Returns dict with keys: smoothed, frangi_map, frangi_binary,
                             hog_weight_map, edge_mask, footprint
     """
-
-    # ----------------------------------------------------------
+    
     # Step 1: Gaussian smoothing
-    # ----------------------------------------------------------
-    smoothed = cv2.GaussianBlur(
-        img,
-        config.GAUSSIAN_KERNEL_SIZE,
-        sigmaX=config.GAUSSIAN_SIGMA,
-    )
+    smoothed = cv2.GaussianBlur(img, config.GAUSSIAN_KERNEL_SIZE, sigmaX=config.GAUSSIAN_SIGMA,)
 
-    # ----------------------------------------------------------
     # Step 2: Frangi vesselness filter
     # black_ridges=False -> detect BRIGHT ridges (actin on dark bg)
-    # ----------------------------------------------------------
     frangi_map = frangi(
         smoothed,
         sigmas=config.FRANGI_SIGMAS,
@@ -115,9 +107,7 @@ def preprocess_image(img: np.ndarray) -> dict:
     # ----------------------------------------------------------
     nonzero_vals = frangi_map[frangi_map > 0]
     if nonzero_vals.size > 0:
-        threshold = np.percentile(
-            nonzero_vals, config.FRANGI_THRESHOLD_PERCENTILE
-        )
+        threshold = np.percentile(nonzero_vals, config.FRANGI_THRESHOLD_PERCENTILE)
     else:
         threshold = 1.0
 
@@ -127,10 +117,7 @@ def preprocess_image(img: np.ndarray) -> dict:
     # Step 4: Remove small components (noise suppression)
     # ----------------------------------------------------------
     if config.FRANGI_MIN_COMPONENT_AREA > 0 and frangi_binary.sum() > 0:
-        cleaned = remove_small_objects(
-            frangi_binary.astype(bool),
-            max_size=config.FRANGI_MIN_COMPONENT_AREA,
-        )
+        cleaned = remove_small_objects(frangi_binary.astype(bool),max_size=config.FRANGI_MIN_COMPONENT_AREA,)
         frangi_binary = cleaned.astype(np.uint8)
 
     # ----------------------------------------------------------
@@ -140,21 +127,13 @@ def preprocess_image(img: np.ndarray) -> dict:
         _, hog_vis = extract_hog_features(smoothed, visualize=True)
 
         if hog_vis.shape != smoothed.shape:
-            hog_vis = cv2.resize(
-                hog_vis, (smoothed.shape[1], smoothed.shape[0])
-            )
+            hog_vis = cv2.resize(hog_vis, (smoothed.shape[1], smoothed.shape[0]))
 
         w = config.HOG_REFINEMENT_WEIGHT
-        hog_weight_map = (
-            frangi_binary.astype(np.float32)
-            * ((1 - w) + w * hog_vis.astype(np.float32))
-        ).astype(np.float32)
+        hog_weight_map = (frangi_binary.astype(np.float32) * ((1 - w) + w * hog_vis.astype(np.float32))).astype(np.float32)
         hog_weight_map = np.clip(hog_weight_map, 0, 1)
 
-        edge_mask = (
-            (hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD)
-            & (frangi_binary > 0)
-        ).astype(np.uint8)
+        edge_mask = ((hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD)& (frangi_binary > 0)).astype(np.uint8)
     else:
         hog_weight_map = frangi_binary.astype(np.float32)
         edge_mask = frangi_binary.copy()
@@ -163,10 +142,7 @@ def preprocess_image(img: np.ndarray) -> dict:
     # Footprint: dilated actin mask used as cell-region proxy
     # for biophysical metrics.
     # ----------------------------------------------------------
-    dil_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (config.BAND_WIDTH_PX * 4 + 1, config.BAND_WIDTH_PX * 4 + 1),
-    )
+    dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(config.BAND_WIDTH_PX * 4 + 1, config.BAND_WIDTH_PX * 4 + 1),)
     footprint = cv2.dilate(edge_mask, dil_kernel, iterations=1).astype(np.uint8)
 
     return {
@@ -220,7 +196,6 @@ def _tf_load_and_label(path_tensor):
     mask.set_shape((h, w, 1))
     return image, mask
 
-
 def _tf_augment(image: tf.Tensor, mask: tf.Tensor):
     """
     Online data augmentation applied to each (image, mask) pair.
@@ -246,21 +221,13 @@ def _tf_augment(image: tf.Tensor, mask: tf.Tensor):
 
     # ── 1. Random horizontal flip ────────────────────────────────────
     do_lr = tf.random.uniform(()) > 0.5
-    image = tf.cond(do_lr,
-                    lambda: tf.image.flip_left_right(image),
-                    lambda: image)
-    mask  = tf.cond(do_lr,
-                    lambda: tf.image.flip_left_right(mask),
-                    lambda: mask)
+    image = tf.cond(do_lr, lambda: tf.image.flip_left_right(image), lambda: image)
+    mask  = tf.cond(do_lr, lambda: tf.image.flip_left_right(mask), lambda: mask)
 
     # ── 2. Random vertical flip ──────────────────────────────────────
     do_ud = tf.random.uniform(()) > 0.5
-    image = tf.cond(do_ud,
-                    lambda: tf.image.flip_up_down(image),
-                    lambda: image)
-    mask  = tf.cond(do_ud,
-                    lambda: tf.image.flip_up_down(mask),
-                    lambda: mask)
+    image = tf.cond(do_ud, lambda: tf.image.flip_up_down(image), lambda: image)
+    mask  = tf.cond(do_ud, lambda: tf.image.flip_up_down(mask), lambda: mask)
 
     # ── 3. Random 90° rotation (0 / 90 / 180 / 270°) ────────────────
     k     = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
@@ -272,63 +239,18 @@ def _tf_augment(image: tf.Tensor, mask: tf.Tensor):
     image = tf.clip_by_value(image, 0.0, 1.0)
 
     # ── 5. Random contrast  (image only) ─────────────────────────────
-    image = tf.image.random_contrast(
-        image,
-        lower=config.AUG_CONTRAST_LOWER,
-        upper=config.AUG_CONTRAST_UPPER,
-    )
+    image = tf.image.random_contrast( image, lower=config.AUG_CONTRAST_LOWER, upper=config.AUG_CONTRAST_UPPER,)
     image = tf.clip_by_value(image, 0.0, 1.0)
 
     # ── 6. Additive Gaussian noise  (image only) ─────────────────────
-    noise = tf.random.normal(
-        tf.shape(image), mean=0.0, stddev=config.AUG_NOISE_STDDEV
-    )
+    noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=config.AUG_NOISE_STDDEV)
     image = tf.clip_by_value(image + noise, 0.0, 1.0)
 
     return image, mask
 
-
-def _load_image_only_numpy(path_bytes):
-    path = path_bytes.numpy().decode("utf-8")
-    img  = load_tif_image(path)
-    img_resized = cv2.resize(
-        img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
-    )
-    return img_resized[..., np.newaxis].astype(np.float32)
-
-
-def _tf_load_image_only(path_tensor):
-    image = tf.py_function(
-        func=_load_image_only_numpy,
-        inp=[path_tensor],
-        Tout=tf.float32,
-    )
-    h, w = config.IMAGE_SIZE
-    image.set_shape((h, w, 1))
-    return image
-
-
-# ============================================================
-# 5. HELPERS
-# ============================================================
-
 def get_image_paths(image_dir=None):
-    image_dir = config.RAW_IMAGE_DIR if image_dir is None else image_dir
-    paths = sorted(
-        glob.glob(os.path.join(image_dir, "*.tif"))
-        + glob.glob(os.path.join(image_dir, "*.tiff"))
-    )
-    if len(paths) == 0:
-        raise RuntimeError(
-            f"No .tif/.tiff images found in {image_dir}. "
-            f"Place your microscopy images there before training."
-        )
+    paths = sorted(glob.glob(os.path.join(image_dir, "*.tif"))+ glob.glob(os.path.join(image_dir, "*.tiff")))
     return paths
-
-
-# ============================================================
-# 6. TRAIN / VALIDATION DATASETS
-# ============================================================
 
 def get_datasets(batch_size=None, val_split=None, seed=None):
     """
@@ -356,10 +278,8 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
     val_split  = config.VAL_SPLIT    if val_split  is None else val_split
     seed       = config.RANDOM_SEED  if seed       is None else seed
 
-    paths   = get_image_paths()
+    paths   = get_image_paths("data/raw")
     n_total = len(paths)
-    if n_total < 2:
-        raise RuntimeError("At least 2 images required for train/val split.")
 
     n_val   = max(1, int(n_total * val_split))
     n_train = n_total - n_val
@@ -371,7 +291,7 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
     train_paths = shuffled[:n_train]
     val_paths   = shuffled[n_train:]
 
-    # ── Training dataset (with augmentation) ──────────────────────────
+    # Training dataset (with augmentation)
     train_ds = (
         tf.data.Dataset
         .from_tensor_slices(train_paths)
@@ -403,7 +323,7 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
         .prefetch(tf.data.AUTOTUNE)
     )
 
-    # ── Validation dataset (NO augmentation) ──────────────────────────
+    # Validation dataset (NO augmentation) 
     val_ds = (
         tf.data.Dataset
         .from_tensor_slices(val_paths)

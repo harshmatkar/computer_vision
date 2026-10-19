@@ -29,8 +29,7 @@ from dataset import get_datasets
 from model_builder import build_and_compile, is_multi_output, num_outputs
 
 
-def _duplicate_target_for_multi_output(ds: tf.data.Dataset,
-                                        n_outputs: int) -> tf.data.Dataset:
+def _duplicate_target_for_multi_output(ds: tf.data.Dataset,n_outputs: int) -> tf.data.Dataset:
     """
     Reshape (image, mask) -> (image, (mask, mask, ...)) with n_outputs
     copies of the mask to match UNet++'s deep-supervision output structure.
@@ -42,12 +41,10 @@ def _duplicate_target_for_multi_output(ds: tf.data.Dataset,
     )
 
 
-def train_model(model_name: str = None):
-    """Train one registered model end-to-end."""
-    model_name    = model_name or config.DEFAULT_MODEL
+def train_model(model_name: str = "unetpp"):
     registry_entry = config.MODEL_REGISTRY[model_name]
 
-    print(f"=== Training {registry_entry['display_name']} ===")
+    print(f"Training {model_name}")
     print(f"GPU available   : {config.GPU_AVAILABLE}")
     print(f"Loss function   : {registry_entry['loss']}")
     print(f"LR              : {config.LEARNING_RATE}")
@@ -70,12 +67,8 @@ def train_model(model_name: str = None):
         train_ds = _duplicate_target_for_multi_output(train_ds, n_out)
         val_ds   = _duplicate_target_for_multi_output(val_ds,   n_out)
 
-    history_path = os.path.join(
-        config.OUTPUT_DIR, f"training_history_{model_name}.csv"
-    )
-    ckpt_path = os.path.join(
-        config.CHECKPOINT_DIR, registry_entry["checkpoint_name"]
-    )
+    history_path = os.path.join(config.OUTPUT_DIR, f"training_history_{model_name}.csv")
+    ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
 
     # Metric to monitor -- the deepest head for multi-output models
     if is_multi_output(model_name):
@@ -138,18 +131,6 @@ def train_model(model_name: str = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model", type=str, default=config.DEFAULT_MODEL,
-        choices=list(config.MODEL_REGISTRY.keys()),
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="Train all three models sequentially.",
-    )
+    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices={"unetpp", "attention_unet", "resunetpp"},)
     args = parser.parse_args()
-
-    if args.all:
-        for name in config.MODEL_REGISTRY.keys():
-            train_model(name)
-    else:
-        train_model(args.model)
+    train_model(args.model)
