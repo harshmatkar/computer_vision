@@ -1,268 +1,416 @@
 """
-dataset.py
-----------
-Handles:
-    1. Loading raw .tif fluorescence microscopy images.
-    2. Classical labeling pipeline (v4 - Frangi ridge detection):
-         Gaussian smoothing
-         -> Frangi vesselness filter
-         -> Percentile threshold
-         -> Small-component removal
-         -> HOG-guided refinement
-    3. Creating tf.data.Dataset pipelines for training, with online
-       augmentation that multiplies effective dataset size by
-       config.AUGMENT_REPEATS (default 20) per epoch.
+dataset.py  (v2 - per-cell boundary bands)
+--------------------------------------------------
+Classical labeling pipeline that follows the project problem statement
+step by step, applied PER CELL so that it also finds the actin between
+neighbouring cells in a dense monolayer. It also builds the tf.data
+pipelines (with augmentation) used by train.py, evaluate.py and
+kfold_eval.py.
 
-CHANGELOG (label modes):
-    - New config.LABEL_MODE selects what the CNN is trained on:
-        "frangi"    -> Frangi ridge labels only (previous behaviour, unchanged)
-        "statement" -> problem-statement labels only (label_statement.py:
-                       Gaussian -> Otsu -> per-cell erosion bands -> HOG +
-                       targeted intensity threshold)
-        "union"     -> pixel-wise OR of both
-    - preprocess_image() still returns every Frangi key it always did, plus
-      "label_mode", "mask_frangi" and (when computed) "mask_statement".
-      "edge_mask" is the FINAL label for the selected mode, so train.py,
-      loocv.py, evaluate.py and the notebooks all follow LABEL_MODE
-      automatically.
+Problem statement                       ->  where it happens here
+----------------------------------------------------------------------------
+Global Cell Segmentation                    build_footprint()
+  Gaussian smoothing + Otsu threshold        (Otsu, with hysteresis so dim
+  -> solid binary mask of the cells           cells and thin protrusions stay)
+(extension) split the mask into cells       segment_cells()
+  marker-controlled watershed                 each cell gets its own boundary
+Boundary Band Definition                    boundary_bands()
+  erode each cell by a pixel radius,          = "cell minus eroded cell", done
+  subtract -> peripheral ring                 for every cell
+HoG based labelling                         hog_edge_strength()
+  gradient-orientation histograms             oriented-edge strength map
+Targeted Intensity Thresholding             label_image(), steps 5-6
+  higher threshold ONLY inside the bands
+Binary Mask Extraction                      label_image(), step 7
 
-CHANGELOG (augmentation fix):
-    - Added _tf_augment(): applies random geometric (flip, rot90) and
-      photometric (brightness, contrast, noise) transforms.  Geometric
-      ops are applied identically to image AND mask; photometric ops
-      to image only.
-    - Modified get_datasets(): adds .cache() -> .repeat() -> .map(augment)
-      pattern so Frangi labeling (expensive) runs only ONCE per image
-      and augmentation generates fresh random variants every epoch.
-      With 5 training images and AUGMENT_REPEATS=20, each epoch now
-      has 100 training examples (50 batches of 2) instead of 2-3
-      batches.  Over 100 epochs this is ~5000 gradient updates vs 33.
+Why per cell?
+  A single footprint for the whole image has only ONE outer edge, so on a
+  dense monolayer the band never reaches the cell-cell junctions that
+  contain most of the actin. Giving every cell its own footprint and band
+  puts the junctions inside bands, which is exactly the problem statement's
+  idea ("cell boundary vs internal cytoplasm") applied cell by cell.
+
+Small, standard additions to the statement's method (cite in the report):
+  * hysteresis thresholding for the footprint        Canny (1986)
+  * marker-controlled watershed to split cells        Meyer & Beucher (1990s)
+  * white top-hat + local (Weber-type) contrast       classical morphology
+  * HOG-style orientation histograms                  Dalal & Triggs (2005)
+  * Otsu thresholding                                 Otsu (1979)
+
+The labeling part only needs numpy / opencv / scipy / skimage. The training
+part imports config.py and tensorflow.
+
+Usage
+-----
+    python dataset.py --input data/raw --output outputs/labels_statement
+
+    from dataset import label_path, Params
+    out = label_path("data/raw/1.tif")
+    out["mask"]        # final binary actin mask (uint8, 0/1)
 """
 
 import os
 import glob
+import argparse
+from dataclasses import dataclass, asdict
 
 import numpy as np
 import cv2
 import tensorflow as tf
 from PIL import Image
-from skimage.filters import frangi
-from skimage.morphology import remove_small_objects
+from scipy import ndimage as ndi
+from skimage.filters import threshold_otsu, apply_hysteresis_threshold
+from skimage.morphology import h_minima, remove_small_objects
+from skimage.segmentation import watershed, find_boundaries
 
 import config
-from utils.hog_processing import extract_hog_features
-from label_statement import label_image as _statement_label_image
-from label_statement import Params as _StatementParams
 
 
-# ============================================================
-# 1. LOAD IMAGE
-# ============================================================
+# PARAMETERS  (pixel sizes are AT image_size resolution, default 256x256)
+@dataclass
+class Params:
+    image_size: tuple = (256, 256)
+    fine_sigma: float = 1.0                  # noise-removal Gaussian
+
+    # ---- 1. global cell segmentation (footprint) ---------------------
+    footprint_sigma: float = 2.0             # blur before Otsu
+    footprint_gamma: float = 0.5             # sqrt-compress so a few very bright pixels
+                                             # do not pull Otsu up (1.0 = linear)
+    footprint_otsu_scale: float = 1.0        # multiplier on the Otsu value
+    footprint_low_frac: float = 0.8          # hysteresis: pixels above 0.8*Otsu count as
+                                             # cell if connected to pixels above Otsu
+                                             # (lower = keep dimmer cells, but the mask
+                                             # starts to bleed into dark background)
+    footprint_close_px: int = 3
+    footprint_min_object_px: int = 150       # drop footprint specks smaller than this
+    footprint_fill_hole_px: int = 200        # fill dark holes smaller than this
+
+    # ---- 2. split into cells (marker-controlled watershed) -----------
+    cell_marker_sigma: float = 3.0           # blur used to find dark cell interiors
+    cell_marker_h: float = 0.012             # depth of an interior minimum to count as a
+                                             # cell (lower = more, smaller cells)
+    cell_elev_sigma: float = 1.5
+
+    # ---- 3. boundary bands (erode each cell, subtract) ---------------
+    band_radius_inner_px: int = 3            # between two neighbouring cells
+    band_radius_outer_px: int = 8            # along the edge facing background
+
+    # ---- 4. contrast measure used for the intensity threshold --------
+    contrast_tophat_px: int = 9              # white top-hat: keeps bright structures
+                                             # narrower than this
+    contrast_norm_sigma: float = 10.0        # local brightness scale
+    contrast_norm_eps: float = 0.10
+
+    # ---- 5. HOG ------------------------------------------------------
+    use_hog: bool = True
+    hog_cell_px: int = 4
+    hog_bins: int = 9
+
+    # ---- 6. targeted thresholds inside the bands (percentiles taken
+    #         over band pixels only) ------------------------------------
+    strong_contrast_percentile: float = 70.0
+    strong_hog_percentile: float = 60.0
+    weak_contrast_percentile: float = 55.0
+    weak_hog_percentile: float = 45.0
+    reach_px: int = 3                        # weak pixels are kept only within this
+                                             # distance of a strong pixel (bridges gaps
+                                             # along a junction, cannot flood the band)
+
+    # ---- 7. clean-up -------------------------------------------------
+    final_close_px: int = 3
+    final_min_object_px: int = 12
 
 def load_tif_image(path: str) -> np.ndarray:
-    """
-    Load a TIFF fluorescence image and normalize it to [0, 1].
-    Handles 16-bit TIFFs and multi-channel inputs (uses first channel).
-    """
-    with Image.open(path) as img:
-        arr = np.array(img, dtype=np.float32)
-
+    """Load a (possibly 16-bit / multi-channel) image, min-max normalise to [0,1]."""
+    with Image.open(path) as im:
+        arr = np.array(im, dtype=np.float32)
     if arr.ndim == 3:
         arr = arr[..., 0]
-
-    lo, hi = arr.min(), arr.max()
-    if hi > lo:
-        arr = (arr - lo) / (hi - lo)
-    else:
-        arr = np.zeros_like(arr)
-
+    lo, hi = float(arr.min()), float(arr.max())
+    arr = (arr - lo) / (hi - lo) if hi > lo else np.zeros_like(arr)
     return arr.astype(np.float32)
 
+def list_images(folder: str):
+    paths = []
+    for e in ("*.tif", "*.tiff", "*.png", "*.jpg", "*.jpeg"):
+        paths += glob.glob(os.path.join(folder, e))
+    return sorted(paths)
 
-def _statement_mask(img: np.ndarray) -> np.ndarray:
+def _ellipse(k: int):
+    k = max(1, int(k))
+    if k % 2 == 0:
+        k += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+# STEP 1 - GLOBAL CELL SEGMENTATION
+def build_footprint(img: np.ndarray, p: Params):
     """
-    Problem-statement label (label_statement.py) for one normalised image
-    already at config.IMAGE_SIZE. Parameters default to
-    label_statement.Params; override any of them via config.STATEMENT_PARAMS.
+    Gaussian smoothing -> Otsu threshold (with hysteresis) -> solid binary
+    mask of everything that is cell.
+
+    Returns footprint (uint8 0/1), otsu_value (in the gamma-compressed domain).
     """
-    params = _StatementParams(
-        image_size=tuple(config.IMAGE_SIZE),
-        **getattr(config, "STATEMENT_PARAMS", {}),
-    )
-    return _statement_label_image(img, params)["mask"].astype(np.uint8)
+    coarse = cv2.GaussianBlur(img, (0, 0), sigmaX=p.footprint_sigma)
+    comp = np.power(np.clip(coarse, 0, 1), p.footprint_gamma)
 
+    t_high = float(threshold_otsu(comp)) * p.footprint_otsu_scale
+    t_low = t_high * p.footprint_low_frac
+    fp = apply_hysteresis_threshold(comp, t_low, t_high).astype(np.uint8)
 
-# ============================================================
-# 2. FRANGI-BASED LABELING PIPELINE
-# ============================================================
+    if p.footprint_close_px > 1:
+        fp = cv2.morphologyEx(fp, cv2.MORPH_CLOSE, _ellipse(p.footprint_close_px))
 
-def preprocess_image(img: np.ndarray) -> dict:
+    if fp.sum() > 0 and p.footprint_min_object_px > 0:
+        fp = remove_small_objects(fp.astype(bool),
+                                  max_size=p.footprint_min_object_px).astype(np.uint8)
+
+    if p.footprint_fill_hole_px > 0:
+        holes = ndi.binary_fill_holes(fp) & (fp == 0)
+        lab, n = ndi.label(holes)
+        if n > 0:
+            areas = ndi.sum(holes, lab, index=np.arange(1, n + 1))
+            small = np.isin(lab, 1 + np.where(areas <= p.footprint_fill_hole_px)[0])
+            fp = np.where(small, 1, fp).astype(np.uint8)
+
+    return fp, t_high
+
+# STEP 2 - SPLIT THE FOOTPRINT INTO INDIVIDUAL CELLS
+def segment_cells(img: np.ndarray, footprint: np.ndarray, p: Params):
     """
-    Generate a binary actin-edge label from one normalized image
-    using a Frangi vesselness filter.
+    Marker-controlled watershed. Dark cell interiors are the markers; the
+    flooding stops on the bright ridges, so the cell borders (watershed
+    lines) follow the actin-rich junctions. Footprint pieces that received
+    no marker (isolated cells) become one cell each.
 
-    Steps:
-        1. Gaussian smoothing
-        2. Frangi vesselness (multi-scale Hessian ridge detector)
-        3. Percentile threshold on non-zero values
-        4. Small-component removal
-        5. HOG-guided refinement (if config.USE_HOG_REFINEMENT)
-
-    Returns dict with keys: smoothed, frangi_map, frangi_binary,
-                            hog_weight_map, edge_mask, footprint
+    Returns an int label image (0 = background, 1..N = cells) and N.
     """
+    fpb = footprint.astype(bool)
+    if not fpb.any():
+        return np.zeros(footprint.shape, np.int32), 0
 
-    # ----------------------------------------------------------
-    # Step 1: Gaussian smoothing
-    # ----------------------------------------------------------
-    smoothed = cv2.GaussianBlur(
-        img,
-        config.GAUSSIAN_KERNEL_SIZE,
-        sigmaX=config.GAUSSIAN_SIGMA,
-    )
+    interior = cv2.GaussianBlur(img, (0, 0), sigmaX=p.cell_marker_sigma)
+    markers, n = ndi.label(h_minima(interior, p.cell_marker_h) & fpb)
 
-    # ----------------------------------------------------------
-    # Step 2: Frangi vesselness filter
-    # black_ridges=False -> detect BRIGHT ridges (actin on dark bg)
-    # ----------------------------------------------------------
-    frangi_map = frangi(
-        smoothed,
-        sigmas=config.FRANGI_SIGMAS,
-        alpha=config.FRANGI_ALPHA,
-        beta=config.FRANGI_BETA,
-        black_ridges=config.FRANGI_BLACK_RIDGES,
-    ).astype(np.float32)
+    comp, nc = ndi.label(fpb)
+    has_marker = np.zeros(nc + 1, bool)
+    has_marker[np.unique(comp[markers > 0])] = True
+    nxt = n + 1
+    for c in range(1, nc + 1):
+        if not has_marker[c]:
+            markers[comp == c] = nxt
+            nxt += 1
 
-    # ----------------------------------------------------------
-    # Step 3: Percentile threshold on non-zero Frangi values
-    # config.FRANGI_THRESHOLD_PERCENTILE = 90 (changed from 94):
-    #   the Frangi response is heavily right-skewed, so only the top
-    #   few percent of non-zero pixels are genuine ridges. Lowering
-    #   from 94 to 90 gives ~3-5% foreground instead of ~1%, reducing
-    #   class imbalance severity for the loss function.
-    # ----------------------------------------------------------
-    nonzero_vals = frangi_map[frangi_map > 0]
-    if nonzero_vals.size > 0:
-        threshold = np.percentile(
-            nonzero_vals, config.FRANGI_THRESHOLD_PERCENTILE
-        )
-    else:
-        threshold = 1.0
+    elevation = cv2.GaussianBlur(img, (0, 0), sigmaX=p.cell_elev_sigma)
+    labels = watershed(elevation, markers, mask=fpb)
+    return labels.astype(np.int32), int(nxt - 1)
 
-    frangi_binary = (frangi_map >= threshold).astype(np.uint8)
+# STEP 3 - BOUNDARY BANDS
+def boundary_bands(labels: np.ndarray, r_inner: int, r_outer: int):
+    """
+    For every cell: erode it by a radius and subtract -> ring along its
+    edge. Pixels within r of the cell edge form the ring, so the union of
+    all cells' rings is computed exactly (and fast) with distance
+    transforms of the cell-edge pixels.
 
-    # ----------------------------------------------------------
-    # Step 4: Remove small components (noise suppression)
-    # ----------------------------------------------------------
-    if config.FRANGI_MIN_COMPONENT_AREA > 0 and frangi_binary.sum() > 0:
-        cleaned = remove_small_objects(
-            frangi_binary.astype(bool),
-            max_size=config.FRANGI_MIN_COMPONENT_AREA,
-        )
-        frangi_binary = cleaned.astype(np.uint8)
+    Two radii: r_outer along edges that face background (the real cell
+    edge, which the blurred footprint tends to place slightly outside the
+    bright rim) and r_inner along edges shared by two neighbouring cells
+    (where the watershed line already sits on the junction ridge).
+    The image frame itself is not treated as a cell edge.
 
-    # ----------------------------------------------------------
-    # Step 5: HOG-guided refinement
-    # ----------------------------------------------------------
-    if config.USE_HOG_REFINEMENT and frangi_binary.sum() > 0:
-        _, hog_vis = extract_hog_features(smoothed, visualize=True)
+    Returns band (uint8 0/1) and the two edge maps for display.
+    """
+    L = labels.astype(np.int32)
+    H, W = L.shape
+    pad = np.pad(L, 1, mode="edge")
+    outer_edge = np.zeros((H, W), bool)
+    inner_edge = np.zeros((H, W), bool)
+    for dy, dx in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+        nb = pad[1 + dy:1 + dy + H, 1 + dx:1 + dx + W]
+        outer_edge |= (L > 0) & (nb == 0)
+        inner_edge |= (L > 0) & (nb > 0) & (nb != L)
 
-        if hog_vis.shape != smoothed.shape:
-            hog_vis = cv2.resize(
-                hog_vis, (smoothed.shape[1], smoothed.shape[0])
-            )
+    d_out = ndi.distance_transform_edt(~outer_edge)
+    d_in = ndi.distance_transform_edt(~inner_edge)
+    band = (L > 0) & ((d_out <= r_outer) | (d_in <= r_inner))
+    return band.astype(np.uint8), outer_edge, inner_edge
 
-        w = config.HOG_REFINEMENT_WEIGHT
-        hog_weight_map = (
-            frangi_binary.astype(np.float32)
-            * ((1 - w) + w * hog_vis.astype(np.float32))
-        ).astype(np.float32)
-        hog_weight_map = np.clip(hog_weight_map, 0, 1)
+# STEP 4 - HOG EDGE-ORIENTATION STRENGTH
+def hog_cell_histograms(img: np.ndarray, cell: int, bins: int):
+    """
+    Core of HOG (Dalal & Triggs, CVPR 2005) without block normalisation:
+    per-cell histograms of gradient orientation (unsigned, 0-180 deg),
+    weighted by gradient magnitude, linearly interpolated between the two
+    nearest bins. Block normalisation is skipped on purpose: it rescales
+    every block to unit length and would erase how strong an edge is.
+    Returns (H//cell, W//cell, bins).
+    """
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    ang = np.degrees(np.arctan2(gy, gx)) % 180.0
 
-        edge_mask = (
-            (hog_weight_map >= config.HOG_REFINEMENT_THRESHOLD)
-            & (frangi_binary > 0)
-        ).astype(np.uint8)
-    else:
-        hog_weight_map = frangi_binary.astype(np.float32)
-        edge_mask = frangi_binary.copy()
+    pos = ang / (180.0 / bins) - 0.5
+    b0f = np.floor(pos)
+    w1 = pos - b0f
+    w0 = 1.0 - w1
+    b0 = b0f.astype(np.int32) % bins
+    b1 = (b0 + 1) % bins
 
-    # ----------------------------------------------------------
-    # Label mode: choose which classical label the CNN learns from.
-    #   frangi    : the Frangi/HOG mask computed above (unchanged)
-    #   statement : label_statement.py (problem-statement pipeline)
-    #   union     : pixel-wise OR of the two
-    # ----------------------------------------------------------
-    label_mode = getattr(config, "LABEL_MODE", "frangi")
-    if label_mode not in ("frangi", "statement", "union"):
-        raise ValueError(
-            f"config.LABEL_MODE must be 'frangi', 'statement' or 'union', "
-            f"got {label_mode!r}"
-        )
+    H, W = img.shape
+    Hc, Wc = H // cell, W // cell
+    hist = np.zeros((Hc, Wc, bins), np.float32)
+    for b in range(bins):
+        v = (mag * (w0 * (b0 == b) + w1 * (b1 == b)))[:Hc * cell, :Wc * cell]
+        hist[..., b] = v.reshape(Hc, cell, Wc, cell).sum(axis=(1, 3))
+    return hist
 
-    mask_frangi = edge_mask.copy()
-    mask_statement = None
-    if label_mode in ("statement", "union"):
-        mask_statement = _statement_mask(img)
-        if label_mode == "statement":
-            edge_mask = mask_statement
-        else:
-            edge_mask = ((mask_frangi > 0) | (mask_statement > 0)).astype(np.uint8)
+def hog_edge_strength(img: np.ndarray, p: Params):
+    """
+    Per-pixel oriented-edge strength from HOG cell histograms:
+        strength = total gradient energy x orientation coherence
+    (coherence = share of the energy in the dominant orientation and its
+    two neighbours). A clean edge has one dominant orientation; speckle
+    spreads its energy over all orientations. Upsampled, scaled to [0,1].
+    """
+    hist = hog_cell_histograms(img, p.hog_cell_px, p.hog_bins)
+    energy = hist.sum(axis=-1)
+    tri = hist + np.roll(hist, 1, axis=-1) + np.roll(hist, -1, axis=-1)
+    coherence = tri.max(axis=-1) / (energy + 1e-6)
 
-    # ----------------------------------------------------------
-    # Footprint: dilated actin mask used as cell-region proxy
-    # for biophysical metrics.
-    # ----------------------------------------------------------
-    dil_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (config.BAND_WIDTH_PX * 4 + 1, config.BAND_WIDTH_PX * 4 + 1),
-    )
-    footprint = cv2.dilate(edge_mask, dil_kernel, iterations=1).astype(np.uint8)
+    s = cv2.resize((energy * coherence).astype(np.float32),
+                   (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+    hi = np.percentile(s, 99.5)
+    return (np.clip(s / hi, 0, 1) if hi > 0 else s).astype(np.float32)
+
+# MAIN: LABEL ONE IMAGE
+def label_image(img: np.ndarray, p: Params = None) -> dict:
+    """
+    Run the full pipeline on one normalised float image in [0,1]
+    (it is resized to p.image_size first). Returns a dict with every
+    intermediate stage plus the final binary mask under "mask".
+    """
+    p = p or Params()
+    h, w = p.image_size
+    interp = cv2.INTER_AREA if img.shape[0] > h else cv2.INTER_LINEAR
+    img = cv2.resize(img, (w, h), interpolation=interp).astype(np.float32)
+
+    smoothed = cv2.GaussianBlur(img, (0, 0), sigmaX=p.fine_sigma)
+
+    # 1-2. footprint, then individual cells
+    footprint, otsu_val = build_footprint(img, p)
+    cells, n_cells = segment_cells(img, footprint, p)
+
+    # 3. per-cell boundary bands
+    band, outer_edge, inner_edge = boundary_bands(
+        cells, p.band_radius_inner_px, p.band_radius_outer_px)
+    bb = band.astype(bool)
+
+    empty = {
+        "image": img, "smoothed": smoothed, "footprint": footprint, "cells": cells,
+        "n_cells": n_cells, "band": band, "outer_edge": outer_edge, "inner_edge": inner_edge,
+        "contrast": np.zeros_like(img), "hog_strength": np.zeros_like(img),
+        "strong": np.zeros_like(band), "mask": np.zeros_like(band),
+        "otsu_value": otsu_val, "actin_pixels": 0, "actin_percent": 0.0, "params": asdict(p),
+    }
+    if bb.sum() < 16:
+        return empty
+
+    # 4. contrast measure: white top-hat (thin bright structures), divided by
+    #    local brightness so dim and bright regions are judged fairly
+    tophat = cv2.morphologyEx(smoothed, cv2.MORPH_TOPHAT, _ellipse(p.contrast_tophat_px))
+    local = cv2.GaussianBlur(smoothed, (0, 0), sigmaX=p.contrast_norm_sigma)
+    contrast = tophat / (local + p.contrast_norm_eps)
+
+    # 5. HOG oriented-edge strength
+    hog = hog_edge_strength(smoothed, p) if p.use_hog else np.ones_like(img)
+
+    # 6. targeted thresholds INSIDE the bands (percentiles over band pixels)
+    def pct(x, q):
+        return float(np.percentile(x[bb], q))
+
+    strong = bb & (contrast >= pct(contrast, p.strong_contrast_percentile))
+    weak = bb & (contrast >= pct(contrast, p.weak_contrast_percentile))
+    if p.use_hog:
+        strong &= hog >= pct(hog, p.strong_hog_percentile)
+        weak &= hog >= pct(hog, p.weak_hog_percentile)
+
+    # weak pixels survive only if connected to a strong pixel AND within reach_px of one
+    near = cv2.dilate(strong.astype(np.uint8), _ellipse(2 * p.reach_px + 1)).astype(bool)
+    lab_w, n_w = ndi.label(weak & near, structure=np.ones((3, 3)))
+    keep = np.zeros(n_w + 1, bool)
+    keep[np.unique(lab_w[strong])] = True
+    keep[0] = False
+    mask = (keep[lab_w] | strong).astype(np.uint8)
+
+    # 7. binary mask extraction
+    if p.final_close_px > 1 and mask.sum() > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _ellipse(p.final_close_px))
+        mask &= band
+    if mask.sum() > 0 and p.final_min_object_px > 0:
+        mask = remove_small_objects(mask.astype(bool),
+                                    max_size=p.final_min_object_px).astype(np.uint8)
 
     return {
-        "smoothed":       smoothed,
-        "frangi_map":     frangi_map,
-        "frangi_binary":  frangi_binary,
-        "hog_weight_map": hog_weight_map,
-        "edge_mask":      edge_mask,
-        "footprint":      footprint,
-        "label_mode":     label_mode,
-        "mask_frangi":    mask_frangi,
-        **({"mask_statement": mask_statement} if mask_statement is not None else {}),
+        "image": img, "smoothed": smoothed, "footprint": footprint, "cells": cells,
+        "n_cells": n_cells, "band": band, "outer_edge": outer_edge, "inner_edge": inner_edge,
+        "contrast": contrast.astype(np.float32), "hog_strength": hog,
+        "strong": strong.astype(np.uint8), "mask": mask,
+        "otsu_value": otsu_val,
+        "actin_pixels": int(mask.sum()),
+        "actin_percent": float(mask.sum()) / mask.size * 100.0,
+        "params": asdict(p),
     }
 
 
-# ============================================================
-# 3. NUMPY LOADER (called inside tf.py_function)
-# ============================================================
+def label_path(path: str, p: Params = None) -> dict:
+    """Load an image file and label it."""
+    out = label_image(load_tif_image(path), p)
+    out["path"] = path
+    return out
 
-def _load_and_label_numpy(path_bytes) -> tuple:
-    """
-    Load and label one image. Returns (H,W,1) float32 image and mask.
-    This is expensive (Frangi at multiple sigmas) -- results are cached
-    in get_datasets() so this runs only ONCE per image per training run.
-    """
+
+# TRAINING DATA PIPELINE (used by train.py, evaluate.py, kfold_eval.py)
+# labeling parameters, using the same image size as the model input
+LABEL_PARAMS = Params(image_size=config.IMAGE_SIZE)
+
+
+def preprocess_image(img):
+    # run the labeling pipeline above on one normalised image
+    out = label_image(img, LABEL_PARAMS)
+
+    # same keys the other scripts already expect
+    return {
+        "smoothed":  out["smoothed"],
+        "edge_mask": out["mask"],        # final binary actin mask = training label
+        "footprint": out["footprint"],   # cell footprint (used by evaluate.py)
+        "band":      out["band"],
+        "cells":     out["cells"],
+    }
+
+
+def get_image_paths(image_dir=None):
+    # default to the raw image folder from config
+    if image_dir is None:
+        image_dir = config.RAW_IMAGE_DIR
+    return list_images(image_dir)
+
+
+def _load_and_label_numpy(path_bytes):
+    # load one image, resize, make its label mask
     path = path_bytes.numpy().decode("utf-8")
-    img  = load_tif_image(path)
+    img = load_tif_image(path)
+    img = cv2.resize(img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
 
-    img_resized = cv2.resize(
-        img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
-    )
+    mask = preprocess_image(img)["edge_mask"].astype(np.float32)
 
-    processed = preprocess_image(img_resized)
-    mask      = processed["edge_mask"].astype(np.float32)
-
-    image_arr = img_resized[..., np.newaxis].astype(np.float32)  # (H,W,1)
-    mask_arr  = mask[..., np.newaxis].astype(np.float32)          # (H,W,1)
+    image_arr = img[..., np.newaxis].astype(np.float32)
+    mask_arr = mask[..., np.newaxis].astype(np.float32)
     return image_arr, mask_arr
 
 
-# ============================================================
-# 4. TF.DATA WRAPPERS
-# ============================================================
-
 def _tf_load_and_label(path_tensor):
-    """TensorFlow wrapper around the numpy Frangi labeling pipeline."""
+    # wrap the numpy function so tf.data can call it
     image, mask = tf.py_function(
         func=_load_and_label_numpy,
         inp=[path_tensor],
@@ -274,192 +422,68 @@ def _tf_load_and_label(path_tensor):
     return image, mask
 
 
-def _tf_augment(image: tf.Tensor, mask: tf.Tensor):
-    """
-    Online data augmentation applied to each (image, mask) pair.
-
-    Geometric transforms (flip, rotate) are applied identically to
-    both image and mask to preserve spatial correspondence.
-    Photometric transforms (brightness, contrast, noise) are applied
-    to image only -- the mask is a binary label and must not change.
-
-    With AUGMENT_REPEATS=20 this generates 20 statistically independent
-    augmented variants of each image per epoch, multiplying the effective
-    training set size 20x without loading any image more than once
-    (the cache() step ensures the Frangi labeling only runs once).
-
-    Operations applied:
-        1. Random horizontal flip (p=0.5)
-        2. Random vertical flip   (p=0.5)
-        3. Random 90° rotation    (k in {0,1,2,3})
-        4. Random brightness jitter  ±BRIGHTNESS_DELTA  (image only)
-        5. Random contrast jitter    [CONTRAST_LOWER, CONTRAST_UPPER] (image only)
-        6. Additive Gaussian noise   σ=NOISE_STDDEV     (image only)
-    """
-
-    # ── 1. Random horizontal flip ────────────────────────────────────
+def _tf_augment(image, mask):
+    # random horizontal flip (image and mask together)
     do_lr = tf.random.uniform(()) > 0.5
-    image = tf.cond(do_lr,
-                    lambda: tf.image.flip_left_right(image),
-                    lambda: image)
-    mask  = tf.cond(do_lr,
-                    lambda: tf.image.flip_left_right(mask),
-                    lambda: mask)
+    image = tf.cond(do_lr, lambda: tf.image.flip_left_right(image), lambda: image)
+    mask = tf.cond(do_lr, lambda: tf.image.flip_left_right(mask), lambda: mask)
 
-    # ── 2. Random vertical flip ──────────────────────────────────────
+    # random vertical flip (image and mask together)
     do_ud = tf.random.uniform(()) > 0.5
-    image = tf.cond(do_ud,
-                    lambda: tf.image.flip_up_down(image),
-                    lambda: image)
-    mask  = tf.cond(do_ud,
-                    lambda: tf.image.flip_up_down(mask),
-                    lambda: mask)
+    image = tf.cond(do_ud, lambda: tf.image.flip_up_down(image), lambda: image)
+    mask = tf.cond(do_ud, lambda: tf.image.flip_up_down(mask), lambda: mask)
 
-    # ── 3. Random 90° rotation (0 / 90 / 180 / 270°) ────────────────
-    k     = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+    # random 90 degree rotation (image and mask together)
+    k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
     image = tf.image.rot90(image, k)
-    mask  = tf.image.rot90(mask,  k)
+    mask = tf.image.rot90(mask, k)
 
-    # ── 4. Random brightness  (image only) ───────────────────────────
+    # brightness, contrast and noise change the image only, never the mask
     image = tf.image.random_brightness(image, max_delta=config.AUG_BRIGHTNESS_DELTA)
     image = tf.clip_by_value(image, 0.0, 1.0)
-
-    # ── 5. Random contrast  (image only) ─────────────────────────────
-    image = tf.image.random_contrast(
-        image,
-        lower=config.AUG_CONTRAST_LOWER,
-        upper=config.AUG_CONTRAST_UPPER,
-    )
+    image = tf.image.random_contrast(image, lower=config.AUG_CONTRAST_LOWER,
+                                     upper=config.AUG_CONTRAST_UPPER)
     image = tf.clip_by_value(image, 0.0, 1.0)
-
-    # ── 6. Additive Gaussian noise  (image only) ─────────────────────
-    noise = tf.random.normal(
-        tf.shape(image), mean=0.0, stddev=config.AUG_NOISE_STDDEV
-    )
+    noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=config.AUG_NOISE_STDDEV)
     image = tf.clip_by_value(image + noise, 0.0, 1.0)
 
     return image, mask
 
 
-def _load_image_only_numpy(path_bytes):
-    path = path_bytes.numpy().decode("utf-8")
-    img  = load_tif_image(path)
-    img_resized = cv2.resize(
-        img, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR
-    )
-    return img_resized[..., np.newaxis].astype(np.float32)
-
-
-def _tf_load_image_only(path_tensor):
-    image = tf.py_function(
-        func=_load_image_only_numpy,
-        inp=[path_tensor],
-        Tout=tf.float32,
-    )
-    h, w = config.IMAGE_SIZE
-    image.set_shape((h, w, 1))
-    return image
-
-
-# ============================================================
-# 5. HELPERS
-# ============================================================
-
-def get_image_paths(image_dir=None):
-    image_dir = config.RAW_IMAGE_DIR if image_dir is None else image_dir
-    paths = sorted(
-        glob.glob(os.path.join(image_dir, "*.tif"))
-        + glob.glob(os.path.join(image_dir, "*.tiff"))
-    )
-    if len(paths) == 0:
-        raise RuntimeError(
-            f"No .tif/.tiff images found in {image_dir}. "
-            f"Place your microscopy images there before training."
-        )
-    return paths
-
-
-# ============================================================
-# 6. TRAIN / VALIDATION DATASETS
-# ============================================================
-
 def get_datasets(batch_size=None, val_split=None, seed=None):
-    """
-    Returns (train_ds, val_ds, n_train, n_val).
+    # use config values when nothing is passed in
+    batch_size = config.BATCH_SIZE if batch_size is None else batch_size
+    val_split = config.VAL_SPLIT if val_split is None else val_split
+    seed = config.RANDOM_SEED if seed is None else seed
 
-    Training pipeline:
-        paths
-        -> map(_tf_load_and_label)    [expensive Frangi -- runs once]
-        -> cache()                    [store (image, mask) in RAM, ~3 MB]
-        -> repeat(AUGMENT_REPEATS)    [repeat cached data N times per epoch]
-        -> shuffle(N * n_train)       [mix elements across repeats]
-        -> map(_tf_augment)           [fresh random augmentation each pass]
-        -> batch(batch_size)
-        -> prefetch(AUTOTUNE)
-
-    With n_train=5 and AUGMENT_REPEATS=20:
-        - Steps per epoch: 5 * 20 / 2 = 50  (vs 2-3 before)
-        - Over 100 epochs: 5,000 gradient updates (vs 33 before)
-        - Effective dataset: 100 unique augmented variants per image
-
-    Validation pipeline has NO augmentation (no .repeat(), no .map(augment))
-    so val metrics reflect performance on the real images unmodified.
-    """
-    batch_size = config.BATCH_SIZE   if batch_size is None else batch_size
-    val_split  = config.VAL_SPLIT    if val_split  is None else val_split
-    seed       = config.RANDOM_SEED  if seed       is None else seed
-
-    paths   = get_image_paths()
+    paths = get_image_paths()
     n_total = len(paths)
-    if n_total < 2:
-        raise RuntimeError("At least 2 images required for train/val split.")
-
-    n_val   = max(1, int(n_total * val_split))
+    n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
 
-    rng      = np.random.default_rng(seed)
-    shuffled = paths.copy()
+    # shuffle the paths once, then split into train and validation
+    rng = np.random.default_rng(seed)
+    shuffled = list(paths)
     rng.shuffle(shuffled)
-
     train_paths = shuffled[:n_train]
-    val_paths   = shuffled[n_train:]
+    val_paths = shuffled[n_train:]
 
-    # ── Training dataset (with augmentation) ──────────────────────────
+    # training: label once, cache, repeat, shuffle, augment, batch
     train_ds = (
-        tf.data.Dataset
-        .from_tensor_slices(train_paths)
-
-        # Load + Frangi label (expensive) ─ runs exactly n_train times total
+        tf.data.Dataset.from_tensor_slices(train_paths)
         .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
-
-        # Cache in RAM so Frangi never runs twice
-        # For 5 images at (256,256,1) float32: ~2.5 MB -- trivial
         .cache()
-
-        # Repeat the cache AUGMENT_REPEATS times per epoch
-        # Each pass will get fresh random augmentation below
         .repeat(config.AUGMENT_REPEATS)
-
-        # Shuffle across all repeats so batches mix different images
-        .shuffle(
-            buffer_size=n_train * config.AUGMENT_REPEATS,
-            seed=seed,
-            reshuffle_each_iteration=True,
-        )
-
-        # Apply random augmentation -- new random values each pass
-        # because tf.random ops are re-sampled every time an element
-        # flows through a .map() call, even for repeated elements.
+        .shuffle(buffer_size=n_train * config.AUGMENT_REPEATS, seed=seed,
+                 reshuffle_each_iteration=True)
         .map(_tf_augment, num_parallel_calls=tf.data.AUTOTUNE)
-
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
     )
 
-    # ── Validation dataset (NO augmentation) ──────────────────────────
+    # validation: no augmentation
     val_ds = (
-        tf.data.Dataset
-        .from_tensor_slices(val_paths)
+        tf.data.Dataset.from_tensor_slices(val_paths)
         .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
         .cache()
         .batch(batch_size)
@@ -467,3 +491,83 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
     )
 
     return train_ds, val_ds, n_train, n_val
+
+# VISUALISATION HELPERS
+def make_overlay(img: np.ndarray, mask: np.ndarray, color=(0, 255, 80), alpha=0.55):
+    """Grey image with the mask painted in `color` (RGB uint8 returned)."""
+    rgb = (np.stack([np.clip(img, 0, 1)] * 3, axis=-1) * 255).astype(np.uint8)
+    layer = rgb.copy()
+    layer[mask.astype(bool)] = color
+    return cv2.addWeighted(rgb, 1 - alpha, layer, alpha, 0)
+
+
+def cell_outline_overlay(img: np.ndarray, cells: np.ndarray):
+    """Grey image with the cell borders drawn in red."""
+    rgb = (np.stack([np.clip(img, 0, 1)] * 3, axis=-1) * 255).astype(np.uint8)
+    rgb[find_boundaries(cells, mode="inner")] = (255, 50, 50)
+    return rgb
+
+
+def build_panel_figure(out: dict, title: str = ""):
+    """Stage-by-stage matplotlib figure (2 rows x 5 columns). Not shown/saved here."""
+    import matplotlib.pyplot as plt
+
+    panels = [
+        ("1. Original", out["image"], "gray"),
+        ("2. Gaussian smoothing", out["smoothed"], "gray"),
+        ("3. Otsu footprint", out["footprint"], "gray"),
+        (f"4. Cells (watershed, n={out['n_cells']})", cell_outline_overlay(out["image"], out["cells"]), None),
+        ("5. Boundary bands (red)", make_overlay(out["image"], out["band"], (255, 60, 60), 0.6), None),
+        ("6. Local contrast (top-hat)", np.clip(out["contrast"] / max(np.percentile(out["contrast"], 99.5), 1e-6), 0, 1), "magma"),
+        ("7. HOG edge strength", out["hog_strength"], "magma"),
+        ("8. Strong pixels in band", out["strong"], "gray"),
+        ("9. Final actin mask", out["mask"], "gray"),
+        ("10. Overlay", make_overlay(out["image"], out["mask"]), None),
+    ]
+    fig, axes = plt.subplots(2, 5, figsize=(17, 7.2))
+    for ax, (t, d, cm) in zip(axes.ravel(), panels):
+        ax.imshow(d, cmap=cm, vmin=0 if cm else None, vmax=1 if cm else None)
+        ax.set_title(t, fontsize=9)
+        ax.axis("off")
+    fig.suptitle(f"{title}   actin px = {out['actin_pixels']} ({out['actin_percent']:.2f}%)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.subplots_adjust(hspace=0.18)
+    return fig
+
+
+def save_panel(out: dict, save_path: str, title: str = ""):
+    import matplotlib.pyplot as plt
+    fig = build_panel_figure(out, title)
+    fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+# CLI
+def main():
+    import matplotlib
+    matplotlib.use("Agg")          # headless; notebooks keep their own backend
+    ap = argparse.ArgumentParser(description="Problem-statement classical labeling (v2).")
+    ap.add_argument("--input", default="data/raw", help="folder with images")
+    ap.add_argument("--output", default="outputs/labels_statement", help="where to save results")
+    args = ap.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+    paths = list_images(args.input)
+    if not paths:
+        raise SystemExit(f"No images found in {args.input}")
+
+    print(f"Labeling {len(paths)} image(s)  ->  {args.output}\n")
+    for path in paths:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out = label_path(path)
+        cv2.imwrite(os.path.join(args.output, f"{stem}_mask.png"), out["mask"] * 255)
+        cv2.imwrite(os.path.join(args.output, f"{stem}_overlay.png"),
+                    cv2.cvtColor(make_overlay(out["image"], out["mask"]), cv2.COLOR_RGB2BGR))
+        save_panel(out, os.path.join(args.output, f"{stem}_panel.png"), title=stem)
+        print(f"  {stem:<20s} cells = {out['n_cells']:4d}   actin px = {out['actin_pixels']:6d} "
+              f"({out['actin_percent']:.2f}%)")
+    print("\nSaved <name>_mask.png, <name>_overlay.png, <name>_panel.png for each image.")
+
+
+if __name__ == "__main__":
+    main()
