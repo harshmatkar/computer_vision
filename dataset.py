@@ -93,7 +93,7 @@ class Params:
 
     # ---- 3. boundary bands (erode each cell, subtract) ---------------
     band_radius_inner_px: int = 3            # between two neighbouring cells
-    band_radius_outer_px: int = 8            # along the edge facing background
+    band_radius_outer_px: int = 5            # along the edge facing background
 
     # ---- 4. contrast measure used for the intensity threshold --------
     contrast_tophat_px: int = 9              # white top-hat: keeps bright structures
@@ -185,8 +185,8 @@ def segment_cells(img: np.ndarray, footprint: np.ndarray, p: Params):
     Returns an int label image (0 = background, 1..N = cells) and N.
     """
     fpb = footprint.astype(bool)
-    if not fpb.any():
-        return np.zeros(footprint.shape, np.int32), 0
+    # if not fpb.any():
+    #     return np.zeros(footprint.shape, np.int32), 0
 
     interior = cv2.GaussianBlur(img, (0, 0), sigmaX=p.cell_marker_sigma)
     markers, n = ndi.label(h_minima(interior, p.cell_marker_h) & fpb)
@@ -203,6 +203,7 @@ def segment_cells(img: np.ndarray, footprint: np.ndarray, p: Params):
     elevation = cv2.GaussianBlur(img, (0, 0), sigmaX=p.cell_elev_sigma)
     labels = watershed(elevation, markers, mask=fpb)
     return labels.astype(np.int32), int(nxt - 1)
+
 
 # STEP 3 - BOUNDARY BANDS
 def boundary_bands(labels: np.ndarray, r_inner: int, r_outer: int):
@@ -264,6 +265,7 @@ def hog_cell_histograms(img: np.ndarray, cell: int, bins: int):
         v = (mag * (w0 * (b0 == b) + w1 * (b1 == b)))[:Hc * cell, :Wc * cell]
         hist[..., b] = v.reshape(Hc, cell, Wc, cell).sum(axis=(1, 3))
     return hist
+
 
 def hog_edge_strength(img: np.ndarray, p: Params):
     """
@@ -541,6 +543,7 @@ def save_panel(out: dict, save_path: str, title: str = ""):
     fig = build_panel_figure(out, title)
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
+
 
 # CLI
 def main():
