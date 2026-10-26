@@ -131,18 +131,25 @@ USE_DEEP_SUPERVISION = True
 
 MODEL_REGISTRY = {
     "unetpp": {
+        "display_name": "Lightweight UNet++ (Depthwise Separable Convs)",
         "loss": "bce_dice",
+        "checkpoint_name": "best_model_unetpp.keras",
         "metrics_csv_name": "actin_metrics_unetpp.csv",
     },
     "attention_unet": {
+        "display_name": "Attention U-Net",
         "loss": "tversky",
+        "checkpoint_name": "best_model_attention_unet.keras",
         "metrics_csv_name": "actin_metrics_attention_unet.csv",
     },
     "resunetpp": {
+        "display_name": "ResUNet++ (Residual + SE + ASPP)",
         "loss": "combo",
+        "checkpoint_name": "best_model_resunetpp.keras",
         "metrics_csv_name": "actin_metrics_resunetpp.csv",
     },
 }
+
 DEFAULT_MODEL = "unetpp"
 
 # Focal Tversky loss (Attention UNet / "tversky")

@@ -196,6 +196,6 @@ def print_benchmark_summary(all_results: dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate one or all of the three team-member models.")
-    parser.add_argument("--model", type=str, default="unetpp",choices={"unetpp", "reunetpp", "attention_unet"},)
+    parser.add_argument("--model", type=str, default="unetpp",choices={"unetpp", "resunetpp", "attention_unet"},)
     args = parser.parse_args()
     evaluate_model(args.model)

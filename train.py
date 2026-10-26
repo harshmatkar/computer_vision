@@ -68,7 +68,7 @@ def train_model(model_name: str = "unetpp"):
         val_ds   = _duplicate_target_for_multi_output(val_ds,   n_out)
 
     history_path = os.path.join(config.OUTPUT_DIR, f"training_history_{model_name}.csv")
-    ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
+    ckpt_path = f"checkpoints/best_model_{model_name}"
 
     # Metric to monitor -- the deepest head for multi-output models
     if is_multi_output(model_name):
