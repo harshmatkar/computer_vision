@@ -1,0 +1,190 @@
+--- a/config.py
++++ b/config.py
+@@ -44,6 +44,11 @@
+             converge rather than overshooting or stopping too early.
+             ReduceLROnPlateau in train.py will halve it automatically if
+             val dice plateaus.
++
++    Diffusion model (new, models/diffusion_seg.py):
++        MODEL_REGISTRY["diffusion"] and the DIFFUSION_* block below.
++        Train with:  python train.py --model diffusion
++        It uses config.IMAGE_SIZE, which must be divisible by 2**DIFFUSION_DEPTH.
+ """
+ 
+ import os
+@@ -147,6 +152,13 @@
+         "checkpoint_name": "best_model_resunetpp.keras",
+         "metrics_csv_name": "actin_metrics_resunetpp.csv",
+     },
++    "diffusion": {
++        "display_name": "Conditional Diffusion Segmenter (SegDiff-style)",
++        "loss": "noise-prediction MSE",
++        "checkpoint_name": "best_model_diffusion.weights.h5",   # weights only (custom model class)
++        "metrics_csv_name": "actin_metrics_diffusion.csv",
++        "weights_only": True,
++    },
+ }
+ DEFAULT_MODEL = "unetpp"
+ 
+@@ -168,6 +180,19 @@
+ COMBO_CE_BETA = 0.85   # was 0.5
+ 
+ # ---------------------------------------------------------------------------
++# DIFFUSION MODEL  (models/diffusion_seg.py)
++# ---------------------------------------------------------------------------
++DIFFUSION_BASE_FILTERS = 16     # width of the first U-Net stage (doubles each stage)
++DIFFUSION_DEPTH        = 3      # down-sampling stages; IMAGE_SIZE must be divisible by 2**DEPTH
++DIFFUSION_TIME_DIM     = 64     # size of the sinusoidal time-step embedding
++DIFFUSION_STEPS        = 200    # T: length of the noising chain used in training
++DIFFUSION_PREDICTION   = "eps"  # "eps" = predict the added noise (standard) | "x0" = predict the mask
++DIFFUSION_SAMPLING_STEPS = 20   # DDIM steps at inference (<= DIFFUSION_STEPS); fewer = faster
++DIFFUSION_NUM_SAMPLES    = 4    # masks generated and averaged per image at inference
++DIFFUSION_VAL_EVERY      = 5    # epochs between sampled-Dice checks on the validation set
++DIFFUSION_VAL_STEPS      = 10   # sampling steps used for those checks (kept cheap)
++
++# ---------------------------------------------------------------------------
+ # TRAINING HYPERPARAMETERS
+ # ---------------------------------------------------------------------------
+ GPU_AVAILABLE = len(tf.config.list_physical_devices("GPU")) > 0
+--- a/train.py
++++ b/train.py
+@@ -6,6 +6,7 @@
+     python train.py --model unetpp          # Member A: Focal + Dice
+     python train.py --model attention_unet  # Member B: Focal Tversky
+     python train.py --model resunetpp       # Member C: Weighted-CE + Dice
++    python train.py --model diffusion       # Conditional diffusion segmenter (noise-prediction MSE)
+     python train.py --all                   # train all three sequentially
+ 
+ CHANGELOG:
+@@ -16,6 +17,9 @@
+       oscillation around a local minimum in later training.
+       This is a standard best-practice addition; no other training logic
+       changed.
++    - Added the "diffusion" model. It trains through the same model.fit() (it has
++      its own train_step), is checkpointed as weights only, monitors a SAMPLED
++      validation Dice (DiffusionValDice callback) and reduces the LR on val_loss.
+ """
+ 
+ import os
+@@ -58,11 +62,17 @@
+     print(f"Steps/epoch     : {steps_per_epoch}  "
+           f"(was ~{n_train // config.BATCH_SIZE} before augmentation)")
+ 
+-    model  = build_and_compile(model_name)
++    is_diffusion = (model_name == "diffusion")
++    if is_diffusion:
++        from models.diffusion_seg import build_diffusion, DiffusionValDice
++        model = build_diffusion()
++    else:
++        model  = build_and_compile(model_name)
+     n_params = model.count_params()
++    multi_output = (not is_diffusion) and is_multi_output(model_name)
+     print(f"Parameters      : {n_params:,}")
+ 
+-    if is_multi_output(model_name):
++    if multi_output:
+         n_out    = num_outputs(model_name)
+         train_ds = _duplicate_target_for_multi_output(train_ds, n_out)
+         val_ds   = _duplicate_target_for_multi_output(val_ds,   n_out)
+@@ -71,7 +81,7 @@
+     ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
+ 
+     # Metric to monitor -- the deepest head for multi-output models
+-    if is_multi_output(model_name):
++    if multi_output:
+         monitor_metric = f"val_output_{config.DEPTH}_dice_metric"
+     else:
+         monitor_metric = "val_dice_metric"
+@@ -83,6 +93,7 @@
+             monitor=monitor_metric,
+             mode="max",
+             save_best_only=True,
++            save_weights_only=registry_entry.get("weights_only", False),
+             verbose=1,
+         ),
+ 
+@@ -104,8 +115,8 @@
+         # and allows continued learning even after the initial LR is
+         # exhausted. min_lr floors it at 1e-6 to avoid numerical issues.
+         tf.keras.callbacks.ReduceLROnPlateau(
+-            monitor=monitor_metric,
+-            mode="max",
++            monitor="val_loss" if is_diffusion else monitor_metric,
++            mode="min" if is_diffusion else "max",
+             factor=0.5,       # multiply LR by 0.5 on plateau
+             patience=7,       # wait 7 epochs before reducing
+             min_lr=1e-6,
+@@ -113,6 +124,12 @@
+         ),
+     ]
+ 
++    if is_diffusion:
++        # must come BEFORE ModelCheckpoint/EarlyStopping: it writes val_dice_metric into the epoch logs
++        callbacks.insert(0, DiffusionValDice(
++            val_ds, every=config.DIFFUSION_VAL_EVERY, steps=config.DIFFUSION_VAL_STEPS,
++            n_samples=1, threshold=config.SEGMENTATION_PROB_THRESHOLD))
++
+     t0 = time.time()
+     model.fit(
+         train_ds,
+@@ -131,6 +148,6 @@
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices={"unetpp", "attention_unet", "resunetpp"},)
++    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices=sorted(config.MODEL_REGISTRY.keys()),)
+     args = parser.parse_args()
+     train_model(args.model)
+--- a/evaluate.py
++++ b/evaluate.py
+@@ -12,6 +12,7 @@
+     python evaluate.py --model unetpp
+     python evaluate.py --model attention_unet
+     python evaluate.py --model resunetpp
++    python evaluate.py --model diffusion    # samples masks (slower); also saves an uncertainty map
+     python evaluate.py --all          # evaluate all three and print a
+                                         # side-by-side summary for benchmarking
+ """
+@@ -65,6 +66,14 @@
+             f"No checkpoint found at {checkpoint_path}. Run `python train.py --model {model_name}` first."
+         )
+ 
++    if model_name == "diffusion":
++        # custom model class -> checkpoint holds WEIGHTS only: rebuild with the same config, then load
++        from models.diffusion_seg import build_diffusion
++        model = build_diffusion()
++        model.load_weights(checkpoint_path)
++        print(f"Loaded diffusion weights from {checkpoint_path} ({model.count_params():,} parameters)")
++        return model, model.count_params()
++
+     # custom_objects not needed: the saved .keras file embeds the full
+     # architecture; compile=False since we only need inference here.
+     model = tf.keras.models.load_model(checkpoint_path, compile=False)
+@@ -76,6 +85,13 @@
+     """Runs a single forward pass and returns the binary predicted mask plus inference time."""
+     tensor = image_resized.astype(np.float32)[np.newaxis, ..., np.newaxis]  # (1, H, W, 1)
+ 
++    if model_name == "diffusion":
++        t0 = time.time()
++        prob, _ = model.sample(tensor, steps=config.DIFFUSION_SAMPLING_STEPS,
++                               n_samples=config.DIFFUSION_NUM_SAMPLES, seed=config.RANDOM_SEED)
++        inference_time = time.time() - t0
++        return (prob[0] >= config.SEGMENTATION_PROB_THRESHOLD).astype(np.uint8), inference_time
++
+     t0 = time.time()
+     outputs = model(tensor, training=False)
+     if is_multi_output(model_name):
+@@ -165,6 +181,13 @@
+             out_path = os.path.join(pred_mask_dir, os.path.splitext(name)[0] + "_pred.png")
+             cv2.imwrite(out_path, pred_mask * 255)
+ 
++            if model_name == "diffusion" and getattr(model, "last_std", None) is not None:
++                unc_dir = os.path.join(config.OUTPUT_DIR, "uncertainty_diffusion")
++                os.makedirs(unc_dir, exist_ok=True)
++                std = model.last_std[0]
++                cv2.imwrite(os.path.join(unc_dir, os.path.splitext(name)[0] + "_std.png"),
++                            (np.clip(std / max(float(std.max()), 1e-6), 0, 1) * 255).astype(np.uint8))
++
+             print(f"[{model_name}][{name}] dice={seg_scores['dice']:.3f} f1={seg_scores['f1']:.3f} "
+                   f"iou={seg_scores['iou']:.3f} PER={biophysical['peripheral_enrichment_ratio']:.3f} "
+                   f"MCC={biophysical['membrane_coverage_continuity_pct']:.1f}%")

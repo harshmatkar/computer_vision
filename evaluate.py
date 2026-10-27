@@ -12,6 +12,7 @@ Usage:
     python evaluate.py --model unetpp
     python evaluate.py --model attention_unet
     python evaluate.py --model resunetpp
+    python evaluate.py --model diffusion    # samples masks (slower); also saves an uncertainty map
     python evaluate.py --all          # evaluate all three and print a
                                         # side-by-side summary for benchmarking
 """
@@ -65,6 +66,14 @@ def load_model(model_name: str):
             f"No checkpoint found at {checkpoint_path}. Run `python train.py --model {model_name}` first."
         )
 
+    if model_name == "diffusion":
+        # custom model class -> checkpoint holds WEIGHTS only: rebuild with the same config, then load
+        from models.diffusion_seg import build_diffusion
+        model = build_diffusion()
+        model.load_weights(checkpoint_path)
+        print(f"Loaded diffusion weights from {checkpoint_path} ({model.count_params():,} parameters)")
+        return model, model.count_params()
+
     # custom_objects not needed: the saved .keras file embeds the full
     # architecture; compile=False since we only need inference here.
     model = tf.keras.models.load_model(checkpoint_path, compile=False)
@@ -75,6 +84,13 @@ def load_model(model_name: str):
 def run_inference(model, image_resized: np.ndarray, model_name: str):
     """Runs a single forward pass and returns the binary predicted mask plus inference time."""
     tensor = image_resized.astype(np.float32)[np.newaxis, ..., np.newaxis]  # (1, H, W, 1)
+
+    if model_name == "diffusion":
+        t0 = time.time()
+        prob, _ = model.sample(tensor, steps=config.DIFFUSION_SAMPLING_STEPS,
+                               n_samples=config.DIFFUSION_NUM_SAMPLES, seed=config.RANDOM_SEED)
+        inference_time = time.time() - t0
+        return (prob[0] >= config.SEGMENTATION_PROB_THRESHOLD).astype(np.uint8), inference_time
 
     t0 = time.time()
     outputs = model(tensor, training=False)
@@ -165,6 +181,13 @@ def evaluate_model(model_name: str):
             out_path = os.path.join(pred_mask_dir, os.path.splitext(name)[0] + "_pred.png")
             cv2.imwrite(out_path, pred_mask * 255)
 
+            if model_name == "diffusion" and getattr(model, "last_std", None) is not None:
+                unc_dir = os.path.join(config.OUTPUT_DIR, "uncertainty_diffusion")
+                os.makedirs(unc_dir, exist_ok=True)
+                std = model.last_std[0]
+                cv2.imwrite(os.path.join(unc_dir, os.path.splitext(name)[0] + "_std.png"),
+                            (np.clip(std / max(float(std.max()), 1e-6), 0, 1) * 255).astype(np.uint8))
+
             print(f"[{model_name}][{name}] dice={seg_scores['dice']:.3f} f1={seg_scores['f1']:.3f} "
                   f"iou={seg_scores['iou']:.3f} PER={biophysical['peripheral_enrichment_ratio']:.3f} "
                   f"MCC={biophysical['membrane_coverage_continuity_pct']:.1f}%")
@@ -196,6 +219,21 @@ def print_benchmark_summary(all_results: dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate one or all of the three team-member models.")
-    parser.add_argument("--model", type=str, default="unetpp",choices={"unetpp", "resunetpp", "attention_unet"},)
+    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
+                         choices=list(config.MODEL_REGISTRY.keys()),
+                         help="Which model to evaluate.")
+    parser.add_argument("--all", action="store_true",
+                         help="Evaluate all three registered models and print a benchmark summary.")
     args = parser.parse_args()
-    evaluate_model(args.model)
+
+    if args.all:
+        results = {}
+        for name in config.MODEL_REGISTRY.keys():
+            try:
+                results[name] = evaluate_model(name)
+            except FileNotFoundError as e:
+                print(f"Skipping {name}: {e}")
+                results[name] = []
+        print_benchmark_summary(results)
+    else:
+        evaluate_model(args.model)

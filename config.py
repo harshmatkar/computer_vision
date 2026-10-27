@@ -44,6 +44,11 @@ CHANGELOG (model-training fix):
             converge rather than overshooting or stopping too early.
             ReduceLROnPlateau in train.py will halve it automatically if
             val dice plateaus.
+
+    Diffusion model (new, models/diffusion_seg.py):
+        MODEL_REGISTRY["diffusion"] and the DIFFUSION_* block below.
+        Train with:  python train.py --model diffusion
+        It uses config.IMAGE_SIZE, which must be divisible by 2**DIFFUSION_DEPTH.
 """
 
 import os
@@ -65,7 +70,9 @@ for _d in (RAW_IMAGE_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
 
 # IMAGE PREPROCESSING
 # This tunes gaussian blurring function, in which pixel value is set to weighted average of its neibouring pixels.
-IMAGE_SIZE           = (256, 256)
+# IMAGE_SIZE           = (256, 256)
+
+IMAGE_SIZE = (512, 512)
 GAUSSIAN_KERNEL_SIZE = (3, 3) # Size of window that does averaging 
 GAUSSIAN_SIGMA       = 1.0 # width of bell curve in pixel larger --> Strong blur
 
@@ -131,25 +138,28 @@ USE_DEEP_SUPERVISION = True
 
 MODEL_REGISTRY = {
     "unetpp": {
-        "display_name": "Lightweight UNet++ (Depthwise Separable Convs)",
         "loss": "bce_dice",
         "checkpoint_name": "best_model_unetpp.keras",
         "metrics_csv_name": "actin_metrics_unetpp.csv",
     },
     "attention_unet": {
-        "display_name": "Attention U-Net",
         "loss": "tversky",
         "checkpoint_name": "best_model_attention_unet.keras",
         "metrics_csv_name": "actin_metrics_attention_unet.csv",
     },
     "resunetpp": {
-        "display_name": "ResUNet++ (Residual + SE + ASPP)",
         "loss": "combo",
         "checkpoint_name": "best_model_resunetpp.keras",
         "metrics_csv_name": "actin_metrics_resunetpp.csv",
     },
+    "diffusion": {
+        "display_name": "Conditional Diffusion Segmenter (SegDiff-style)",
+        "loss": "noise-prediction MSE",
+        "checkpoint_name": "best_model_diffusion.weights.h5",   # weights only (custom model class)
+        "metrics_csv_name": "actin_metrics_diffusion.csv",
+        "weights_only": True,
+    },
 }
-
 DEFAULT_MODEL = "unetpp"
 
 # Focal Tversky loss (Attention UNet / "tversky")
@@ -168,6 +178,19 @@ TVERSKY_BETA  = 0.65   # was 0.3
 #                   beta=0.5 (old) -> pos_weight=1: unweighted, collapses.
 COMBO_ALPHA   = 0.5
 COMBO_CE_BETA = 0.85   # was 0.5
+
+# ---------------------------------------------------------------------------
+# DIFFUSION MODEL  (models/diffusion_seg.py)
+# ---------------------------------------------------------------------------
+DIFFUSION_BASE_FILTERS = 16     # width of the first U-Net stage (doubles each stage)
+DIFFUSION_DEPTH        = 3      # down-sampling stages; IMAGE_SIZE must be divisible by 2**DEPTH
+DIFFUSION_TIME_DIM     = 64     # size of the sinusoidal time-step embedding
+DIFFUSION_STEPS        = 200    # T: length of the noising chain used in training
+DIFFUSION_PREDICTION   = "eps"  # "eps" = predict the added noise (standard) | "x0" = predict the mask
+DIFFUSION_SAMPLING_STEPS = 20   # DDIM steps at inference (<= DIFFUSION_STEPS); fewer = faster
+DIFFUSION_NUM_SAMPLES    = 4    # masks generated and averaged per image at inference
+DIFFUSION_VAL_EVERY      = 5    # epochs between sampled-Dice checks on the validation set
+DIFFUSION_VAL_STEPS      = 10   # sampling steps used for those checks (kept cheap)
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS

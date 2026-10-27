@@ -6,6 +6,7 @@ Training entry point for all three registered models.
     python train.py --model unetpp          # Member A: Focal + Dice
     python train.py --model attention_unet  # Member B: Focal Tversky
     python train.py --model resunetpp       # Member C: Weighted-CE + Dice
+    python train.py --model diffusion       # Conditional diffusion segmenter (noise-prediction MSE)
     python train.py --all                   # train all three sequentially
 
 CHANGELOG:
@@ -16,6 +17,9 @@ CHANGELOG:
       oscillation around a local minimum in later training.
       This is a standard best-practice addition; no other training logic
       changed.
+    - Added the "diffusion" model. It trains through the same model.fit() (it has
+      its own train_step), is checkpointed as weights only, monitors a SAMPLED
+      validation Dice (DiffusionValDice callback) and reduces the LR on val_loss.
 """
 
 import os
@@ -58,20 +62,26 @@ def train_model(model_name: str = "unetpp"):
     print(f"Steps/epoch     : {steps_per_epoch}  "
           f"(was ~{n_train // config.BATCH_SIZE} before augmentation)")
 
-    model  = build_and_compile(model_name)
+    is_diffusion = (model_name == "diffusion")
+    if is_diffusion:
+        from models.diffusion_seg import build_diffusion, DiffusionValDice
+        model = build_diffusion()
+    else:
+        model  = build_and_compile(model_name)
     n_params = model.count_params()
+    multi_output = (not is_diffusion) and is_multi_output(model_name)
     print(f"Parameters      : {n_params:,}")
 
-    if is_multi_output(model_name):
+    if multi_output:
         n_out    = num_outputs(model_name)
         train_ds = _duplicate_target_for_multi_output(train_ds, n_out)
         val_ds   = _duplicate_target_for_multi_output(val_ds,   n_out)
 
     history_path = os.path.join(config.OUTPUT_DIR, f"training_history_{model_name}.csv")
-    ckpt_path = f"checkpoints/best_model_{model_name}"
+    ckpt_path = os.path.join(config.CHECKPOINT_DIR, registry_entry["checkpoint_name"])
 
     # Metric to monitor -- the deepest head for multi-output models
-    if is_multi_output(model_name):
+    if multi_output:
         monitor_metric = f"val_output_{config.DEPTH}_dice_metric"
     else:
         monitor_metric = "val_dice_metric"
@@ -83,6 +93,7 @@ def train_model(model_name: str = "unetpp"):
             monitor=monitor_metric,
             mode="max",
             save_best_only=True,
+            save_weights_only=registry_entry.get("weights_only", False),
             verbose=1,
         ),
 
@@ -104,14 +115,20 @@ def train_model(model_name: str = "unetpp"):
         # and allows continued learning even after the initial LR is
         # exhausted. min_lr floors it at 1e-6 to avoid numerical issues.
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor=monitor_metric,
-            mode="max",
+            monitor="val_loss" if is_diffusion else monitor_metric,
+            mode="min" if is_diffusion else "max",
             factor=0.5,       # multiply LR by 0.5 on plateau
             patience=7,       # wait 7 epochs before reducing
             min_lr=1e-6,
             verbose=1,
         ),
     ]
+
+    if is_diffusion:
+        # must come BEFORE ModelCheckpoint/EarlyStopping: it writes val_dice_metric into the epoch logs
+        callbacks.insert(0, DiffusionValDice(
+            val_ds, every=config.DIFFUSION_VAL_EVERY, steps=config.DIFFUSION_VAL_STEPS,
+            n_samples=1, threshold=config.SEGMENTATION_PROB_THRESHOLD))
 
     t0 = time.time()
     model.fit(
@@ -131,6 +148,6 @@ def train_model(model_name: str = "unetpp"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices={"unetpp", "attention_unet", "resunetpp"},)
+    parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,choices=sorted(config.MODEL_REGISTRY.keys()),)
     args = parser.parse_args()
     train_model(args.model)
