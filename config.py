@@ -66,6 +66,8 @@ for _d in (RAW_IMAGE_DIR, CHECKPOINT_DIR, OUTPUT_DIR):
 # IMAGE PREPROCESSING
 # This tunes gaussian blurring function, in which pixel value is set to weighted average of its neibouring pixels.
 IMAGE_SIZE           = (256, 256)
+PATCH_SIZE           = 256
+PATCH_STRIDE = 128
 GAUSSIAN_KERNEL_SIZE = (3, 3) # Size of window that does averaging 
 GAUSSIAN_SIGMA       = 1.0 # width of bell curve in pixel larger --> Strong blur
 

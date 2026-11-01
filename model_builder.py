@@ -11,6 +11,10 @@ logits head per supervised decoder depth); Members B and C are
 single-output models. `is_multi_output()` / `num_outputs()` let train.py
 adapt the tf.data pipeline (duplicating the target mask once per output)
 without needing to know which architecture is currently selected.
+
+CHANGELOG:
+    - The model input is now the PATCH size (config.PATCH_SIZE), because
+      dataset.py gives the model cropped patches instead of full images.
 """
 
 import config
@@ -39,7 +43,8 @@ def build_model(model_name: str):
             f"Unknown model_name {model_name!r}. Valid options: {list(config.MODEL_REGISTRY.keys())}"
         )
 
-    input_shape = (config.IMAGE_SIZE[0], config.IMAGE_SIZE[1], config.IN_CHANNELS)
+    # the model now sees patches, not full images
+    input_shape = (config.PATCH_SIZE, config.PATCH_SIZE, config.IN_CHANNELS)
 
     if model_name == "unetpp":
         model = build_unet_plus_plus(

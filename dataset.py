@@ -1,7 +1,7 @@
 """
 dataset.py
 ----------
-Handles:
+ALL data handling lives here (and only here):
     1. Loading raw .tif fluorescence microscopy images.
     2. Classical labeling pipeline (v4 - Frangi ridge detection):
          Gaussian smoothing
@@ -9,15 +9,18 @@ Handles:
          -> Percentile threshold
          -> Small-component removal
          -> HOG-guided refinement
-    3. Creating tf.data.Dataset pipelines for training, with online
+    3. tf.data pipelines for normal training (train.py), with online
        augmentation that multiplies effective dataset size by
        config.AUGMENT_REPEATS per epoch.
+    4. Array helpers for cross-validation / ablation / final training:
+       load + label everything once, folds, patches, array-based tf.data.
 
 CHANGELOG:
     - Added _tf_augment() and the cache -> repeat -> shuffle -> augment pattern.
-    - Added build_train_ds(train_paths): builds the augmented training
-      pipeline from an EXPLICIT list of paths. Used by kfold_eval.py so each
-      LOOCV fold can train on N-1 images. get_datasets() now reuses it.
+    - Added build_train_ds(train_paths) for kfold_eval.py (LOOCV).
+    - Section 6: load_all_images, make_folds, check_sizes, make_patches,
+      get_repeats, build_train_ds_from_arrays (moved here from
+      ablation_study.py so that data handling is in one place).
 """
 
 import os
@@ -239,6 +242,25 @@ def _tf_augment(image: tf.Tensor, mask: tf.Tensor):
 
     return image, mask
 
+def _tf_to_patches(image, mask):
+    """Cut one (H,W,1) image and its mask into a dataset of (p,p,1) patches."""
+    p = config.PATCH_SIZE
+    s = config.PATCH_STRIDE
+
+    # extract_patches works on a batch, so add a batch dimension first
+    img_p = tf.image.extract_patches(
+        images=image[None], sizes=[1, p, p, 1],
+        strides=[1, s, s, 1], rates=[1, 1, 1, 1], padding="VALID",
+    )
+    msk_p = tf.image.extract_patches(
+        images=mask[None], sizes=[1, p, p, 1],
+        strides=[1, s, s, 1], rates=[1, 1, 1, 1], padding="VALID",
+    )
+
+    # (1, rows, cols, p*p) -> (n_patches, p, p, 1)
+    img_p = tf.reshape(img_p, (-1, p, p, 1))
+    msk_p = tf.reshape(msk_p, (-1, p, p, 1))
+    return tf.data.Dataset.from_tensor_slices((img_p, msk_p))
 
 def get_image_paths(image_dir=None):
     image_dir = "data/raw" if image_dir is None else image_dir
@@ -250,34 +272,33 @@ def get_image_paths(image_dir=None):
 
 
 # ============================================================
-# 5. DATASET BUILDERS
+# 5. DATASET BUILDERS (path based: train.py, kfold_eval.py)
 # ============================================================
+def patches_per_image():
+    """How many patches one image gives with the current settings."""
+    h, w = config.IMAGE_SIZE
+    p, s = config.PATCH_SIZE, config.PATCH_STRIDE
+    return ((h - p) // s + 1) * ((w - p) // s + 1)
+
 
 def build_train_ds(train_paths, batch_size=None, seed=None):
-    """
-    Build the augmented training pipeline from an explicit list of paths.
-
-        paths
-        -> map(_tf_load_and_label)    [expensive Frangi -- runs once]
-        -> cache()
-        -> repeat(AUGMENT_REPEATS)
-        -> shuffle(n * AUGMENT_REPEATS)
-        -> map(_tf_augment)           [fresh random augmentation each pass]
-        -> batch(batch_size)
-        -> prefetch(AUTOTUNE)
-    """
     batch_size = config.BATCH_SIZE  if batch_size is None else batch_size
     seed       = config.RANDOM_SEED if seed       is None else seed
-    n_train    = len(train_paths)
+
+    n_patches = len(train_paths) * patches_per_image()
+
+    # each image gives several patches, so repeat less to keep the epoch length similar
+    repeats = max(1, config.AUGMENT_REPEATS // patches_per_image())
 
     return (
         tf.data.Dataset
         .from_tensor_slices(list(train_paths))
         .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
+        .flat_map(_tf_to_patches)          # full image -> patches
         .cache()
-        .repeat(config.AUGMENT_REPEATS)
+        .repeat(repeats)
         .shuffle(
-            buffer_size=n_train * config.AUGMENT_REPEATS,
+            buffer_size=n_patches * repeats,
             seed=seed,
             reshuffle_each_iteration=True,
         )
@@ -288,12 +309,13 @@ def build_train_ds(train_paths, batch_size=None, seed=None):
 
 
 def build_val_ds(val_paths, batch_size=None):
-    """Validation pipeline: NO augmentation, so metrics reflect real images."""
+    """Validation patches, no augmentation."""
     batch_size = config.BATCH_SIZE if batch_size is None else batch_size
     return (
         tf.data.Dataset
         .from_tensor_slices(list(val_paths))
         .map(_tf_load_and_label, num_parallel_calls=tf.data.AUTOTUNE)
+        .flat_map(_tf_to_patches)
         .cache()
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
@@ -324,3 +346,118 @@ def get_datasets(batch_size=None, val_split=None, seed=None):
     val_ds   = build_val_ds(val_paths, batch_size=batch_size)
 
     return train_ds, val_ds, n_train, n_val
+
+
+# ============================================================
+# 6. ARRAY HELPERS (cross-validation, ablation, final training)
+#    Everything is loaded and labelled ONCE into numpy arrays, so
+#    the slow Frangi step is not repeated per fold / per model.
+# ============================================================
+
+def _hw(v):
+    """Accept an int (256) or a tuple/list ((256, 256)); return (h, w)."""
+    if isinstance(v, (tuple, list)):
+        return int(v[0]), int(v[1])
+    return int(v), int(v)
+
+
+def load_all_images(image_dir=None):
+    """Load, resize and label EVERY image once. Returns names, X, Y (N,H,W,1)."""
+    paths = get_image_paths(image_dir)
+    if len(paths) < 2:
+        raise RuntimeError("Need at least 2 images.")
+    names, xs, ys = [], [], []
+    for p in paths:
+        raw = load_tif_image(p)
+        img = cv2.resize(raw, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
+        mask = preprocess_image(img)["edge_mask"]
+        names.append(os.path.basename(p))
+        xs.append(img[..., None].astype(np.float32))
+        ys.append(mask[..., None].astype(np.float32))
+    return names, np.stack(xs), np.stack(ys)
+
+
+def make_folds(n: int, k, seed: int):
+    """k=None (or k>=n): leave-one-out, one image per fold.
+    Otherwise shuffle indices once and split into k folds that partition the data."""
+    if k is None or k >= n:
+        return [np.array([i]) for i in range(n)]
+    perm = np.random.default_rng(seed).permutation(n)
+    return [np.sort(f) for f in np.array_split(perm, k)]
+
+
+def check_sizes(depth, full_images=False):
+    """U-Net style nets need sizes divisible by 2**depth (patch AND full image)."""
+    m = 2 ** depth
+    ih, iw = _hw(config.IMAGE_SIZE)
+    items = [("IMAGE height", ih), ("IMAGE width", iw)]
+    if not full_images:
+        ph, pw = _hw(config.PATCH_SIZE)
+        items += [("PATCH height", ph), ("PATCH width", pw)]
+        if ph > ih or pw > iw:
+            raise ValueError("PATCH_SIZE is larger than IMAGE_SIZE")
+    bad = [(nm, v) for nm, v in items if v % m != 0]
+    if bad:
+        raise ValueError(f"These must be divisible by 2**DEPTH = {m}: {bad}")
+
+
+def make_patches(X, Y):
+    """Cut image arrays into patches with config.PATCH_SIZE / PATCH_STRIDE.
+    Same grid as _tf_to_patches (VALID padding)."""
+    ph, pw = _hw(config.PATCH_SIZE)
+    sh, sw = _hw(config.PATCH_STRIDE)
+    n, h, w, _ = X.shape
+    xs, ys = [], []
+    for i in range(n):
+        for r in range(0, h - ph + 1, sh):
+            for c in range(0, w - pw + 1, sw):
+                xs.append(X[i, r:r + ph, c:c + pw])
+                ys.append(Y[i, r:r + ph, c:c + pw])
+    return np.stack(xs), np.stack(ys)
+
+
+def get_repeats(full_images=False):
+    """How often the training set is repeated per epoch (same logic as build_train_ds)."""
+    if full_images:
+        return max(1, config.AUGMENT_REPEATS)
+    return max(1, config.AUGMENT_REPEATS // patches_per_image())
+
+
+def build_train_ds_from_arrays(Xp, Yp, seed=None, repeats=1, batch_size=None):
+    """cache -> repeat -> shuffle -> augment -> batch, from preloaded arrays."""
+    batch_size = config.BATCH_SIZE  if batch_size is None else batch_size
+    seed       = config.RANDOM_SEED if seed       is None else seed
+    n = len(Xp)
+    return (
+        tf.data.Dataset.from_tensor_slices((Xp, Yp))
+        .cache()
+        .repeat(repeats)
+        .shuffle(n * repeats, seed=seed, reshuffle_each_iteration=True)
+        .map(_tf_augment, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+
+# ============================================================
+# 7. PREDICTION-TIME HELPERS (used by predict.py)
+# ============================================================
+
+def load_images_for_prediction(folder):
+    """Load UNLABELLED images for inference. Returns a list of
+    (name, image (H,W,1) float32 resized to config.IMAGE_SIZE, original (h, w))."""
+    out = []
+    for p in get_image_paths(folder):
+        raw = load_tif_image(p)
+        img = cv2.resize(raw, config.IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
+        out.append((os.path.splitext(os.path.basename(p))[0],
+                    img[..., None].astype(np.float32), raw.shape))
+    return out
+
+
+def save_mask(path, mask, original_shape):
+    """Resize a binary mask back to the original image size and save it as a
+    0/255 PNG."""
+    h, w = original_shape
+    mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+    Image.fromarray(mask * 255).save(path)
