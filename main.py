@@ -26,7 +26,8 @@ import tensorflow as tf
 import config
 from args import a
 
-from dataset import (load_all_images, make_folds, check_sizes, make_patches, get_repeats, build_train_ds_from_arrays)
+from dataset import (load_all_images, make_folds, check_sizes, make_patches,
+                     get_repeats, build_train_ds_from_arrays)
 import inspect
 import models.models as M
 get_model = M.get_model
@@ -34,14 +35,18 @@ count_parameters = getattr(M, "count_parameters", None) or (lambda m: int(m.coun
 ALL_MODELS = getattr(M, "ALL_MODELS", None)   # None: your models.py has no list, names are not checked here
 
 from utils.ablation_losses import bce_dice_loss
-from utils.ablation_metrics import (METRICS, confusion_counts, metrics_from_counts,summarize, stats_on_dice, label)
-from utils.ablation_plots import plot_violins, plot_prediction_grids
-from utils.ablation_io import (make_run_dir, start_log, append_rows, save_json,save_fold_predictions)
+from utils.ablation_metrics import (METRICS, confusion_counts, metrics_from_counts,
+                                    summarize, stats_on_dice, label)
+from utils.ablation_plots import plot_violins, plot_prediction_grids, plot_loss_curves
+from utils.ablation_io import (make_run_dir, start_log, append_rows, save_json,
+                               save_fold_predictions)
 
 BASE_FILTERS = getattr(config, "BASE_FILTERS", 16)
 DEPTH = getattr(config, "DEPTH", 4)
-VARIANT_FILTERS = {}
+VARIANT_FILTERS = {}      # per-model base filters, filled by --match-params
 
+
+# ----------------------------------------------------------------- training
 def build_model(variant, base_filters):
     """Calls get_model whatever its signature is:
        get_model(variant, input_shape, base_filters, depth)   (models/models.py from me), or
@@ -68,16 +73,29 @@ def train(variant, X_tr, Y_tr, epochs, seed, full_images=False, verbose_info=Fal
         print(f"  training on {'full images' if full_images else 'patches'}: {len(Xp)} of "
               f"shape {Xp.shape[1:3]}, repeats={repeats}, ~{steps} steps/epoch")
 
+    # free spatial size: train on patches, predict on the full image
     model = build_model(variant, VARIANT_FILTERS.get(variant, BASE_FILTERS))
     model.compile(optimizer=tf.keras.optimizers.Adam(config.LEARNING_RATE), loss=bce_dice_loss)
-    model.fit(
+    history = model.fit(
         build_train_ds_from_arrays(Xp, Yp, seed=seed, repeats=repeats),
         epochs=epochs,
         callbacks=[tf.keras.callbacks.ReduceLROnPlateau(
             monitor="loss", factor=0.5, patience=7, min_lr=1e-6, verbose=0)],
         verbose=2,
     )
-    return model
+    return model, history.history          # history: loss (and learning rate) per epoch
+
+
+def loss_rows_from_history(variant, fold, hist):
+    """One row per epoch: model, fold, epoch, training loss (+ learning rate if logged)."""
+    lr = hist.get("learning_rate", hist.get("lr"))
+    rows = []
+    for e, loss in enumerate(hist["loss"]):
+        row = dict(model=variant, fold=fold, epoch=e + 1, loss=float(loss))
+        if lr is not None:
+            row["learning_rate"] = float(lr[e])
+        rows.append(row)
+    return rows
 
 
 def predict_mask(model, img):
@@ -159,6 +177,8 @@ def run(epochs, k, seed, models, full_images, match_params, ref, run_dir, cli_ar
     save_json(os.path.join(run_dir, "run_config.json"), meta)
 
     per_image_csv = os.path.join(run_dir, "ablation_per_image.csv")
+    loss_csv = os.path.join(run_dir, "ablation_loss_per_epoch.csv")
+    loss_rows = []
     rows, preds = [], {m: {} for m in to_train}
     for f, test_idx in enumerate(folds, 1):
         train_idx = np.setdiff1d(np.arange(n), test_idx)
@@ -166,12 +186,15 @@ def run(epochs, k, seed, models, full_images, match_params, ref, run_dir, cli_ar
         for mi, m in enumerate(to_train):
             print(f"\n[fold {f}/{k}] {label(m)}  "
                   f"(train {len(train_idx)}, test {len(test_idx)})")
-            model = train(m, X[train_idx], Y[train_idx], epochs, seed,
+            model, hist = train(m, X[train_idx], Y[train_idx], epochs, seed,
                           full_images=full_images, verbose_info=(f == 1 and mi == 0))
             if f == 1:
                 meta["parameters"][m] = count_parameters(model)
                 print(f"  parameters: {meta['parameters'][m]:,}")
                 save_json(os.path.join(run_dir, "run_config.json"), meta)
+            new_loss = loss_rows_from_history(m, f, hist)
+            loss_rows += new_loss
+            append_rows(loss_csv, new_loss)                  # loss per epoch, saved immediately
             new_rows = []
             for i in test_idx:
                 pred = predict_mask(model, X[i])
@@ -197,6 +220,7 @@ def run(epochs, k, seed, models, full_images, match_params, ref, run_dir, cli_ar
     if len(to_train) >= 2:                      # statistics need 2+ models
         stats_on_dice(df_fold, to_train, run_dir, ref=ref)
     plot_violins(df_fold, to_train, run_dir, n_images=n)
+    plot_loss_curves(pd.DataFrame(loss_rows), to_train, run_dir)
     plot_prediction_grids(names, X, Y, preds, df_img, to_train, run_dir)
     print(f"\nAll outputs of this run saved in: {run_dir}")
 
@@ -230,7 +254,8 @@ if __name__ == "__main__":
     epochs = a.epochs or config.NUM_EPOCHS
     ref = getattr(a, "ref", None) or "unet"
 
-    run_dir = make_run_dir(os.path.join(config.OUTPUT_DIR, "ablation"), getattr(a, "name", None) or run_name(a, seed))
+    run_dir = make_run_dir(os.path.join(config.OUTPUT_DIR, "ablation"),
+                           getattr(a, "name", None) or run_name(a, seed))
     start_log(run_dir)
     print(f"Run folder: {run_dir}")
 

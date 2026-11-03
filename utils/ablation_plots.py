@@ -111,3 +111,46 @@ def plot_prediction_grids(names, X, Y, preds, df_img, models, out_dir):
     plt.savefig(p2, dpi=120, bbox_inches="tight")
     plt.close()
     print(f"  Prediction grid saved: {p1}\n  Error-map grid saved: {p2}")
+
+
+def plot_loss_curves(df_loss, models, out_dir):
+    """Training loss per epoch (BCE + Dice loss).
+    One panel per model: thin line = one fold, thick line = mean over folds.
+    With 2+ models an extra panel compares the mean curves.
+    (Training loss only: the held-out image is never used during training.)"""
+    n = len(models)
+    panels = n + (1 if n >= 2 else 0)
+    fig, axes = plt.subplots(1, panels, figsize=(4.6 * panels, 4.2), squeeze=False, sharey=True)
+    axes = axes[0]
+    for ax, m in zip(axes, models):
+        col = COLORS.get(m, "#607D8B")
+        sub = df_loss[df_loss.model == m]
+        for _, g in sub.groupby("fold"):
+            ax.plot(g["epoch"], g["loss"], color=col, alpha=0.3, lw=0.8)
+        mean = sub.groupby("epoch")["loss"].mean()
+        ax.plot(mean.index, mean.values, color=col, lw=2.4, label="mean over folds")
+        ax.set_title(label(m), fontsize=12, fontweight="bold")
+        ax.legend(fontsize=8)
+    if n >= 2:
+        ax = axes[-1]
+        for m in models:
+            mean = df_loss[df_loss.model == m].groupby("epoch")["loss"].mean()
+            ax.plot(mean.index, mean.values, color=COLORS.get(m, "#607D8B"), lw=2, label=label(m))
+        ax.set_title("mean over folds", fontsize=12, fontweight="bold")
+        ax.legend(fontsize=8)
+    from matplotlib.ticker import MaxNLocator, FuncFormatter
+    plain = FuncFormatter(lambda v, _: f"{v:g}")
+    for ax in axes:
+        ax.set_xlabel("epoch")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))     # whole epochs only
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(plain)                        # 0.5, 1, 2 instead of 10^x
+        ax.yaxis.set_minor_formatter(plain)
+        ax.grid(True, linestyle="--", alpha=0.5)
+    axes[0].set_ylabel("training loss (BCE + Dice)")
+    fig.suptitle("Training loss per epoch", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(out_dir, "ablation_loss_curves.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Loss curves saved: {path}")
