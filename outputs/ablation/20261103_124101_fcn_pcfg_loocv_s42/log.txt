@@ -1,0 +1,493 @@
+Run folder: /home/harsh/CV_work/group_8/outputs/ablation/20261103_124101_fcn_pcfg_loocv_s42
+
+Models: fcn
+6 images, LOOCV (6 folds, seed=42), 100 epochs/fold, patches
+  fold 1: test = ['1.tif']
+  fold 2: test = ['2.tif']
+  fold 3: test = ['3.tif']
+  fold 4: test = ['4.tif']
+  fold 5: test = ['5.tif']
+  fold 6: test = ['6.tif']
+
+[fold 1/6] fcn  (train 5, test 1)
+  training on patches: 5 of shape (256, 256), repeats=20, ~50 steps/epoch
+Epoch 1/100
+50/50 - 43s - 860ms/step - loss: 1.1749 - learning_rate: 5.0000e-04
+Epoch 2/100
+50/50 - 3s - 68ms/step - loss: 0.9455 - learning_rate: 5.0000e-04
+Epoch 3/100
+50/50 - 4s - 70ms/step - loss: 0.9233 - learning_rate: 5.0000e-04
+Epoch 4/100
+50/50 - 3s - 62ms/step - loss: 0.9111 - learning_rate: 5.0000e-04
+Epoch 5/100
+50/50 - 3s - 61ms/step - loss: 0.8954 - learning_rate: 5.0000e-04
+Epoch 6/100
+50/50 - 3s - 63ms/step - loss: 0.8918 - learning_rate: 5.0000e-04
+Epoch 7/100
+50/50 - 3s - 64ms/step - loss: 0.8862 - learning_rate: 5.0000e-04
+Epoch 8/100
+50/50 - 3s - 60ms/step - loss: 0.8817 - learning_rate: 5.0000e-04
+Epoch 9/100
+50/50 - 3s - 62ms/step - loss: 0.8794 - learning_rate: 5.0000e-04
+Epoch 10/100
+50/50 - 3s - 62ms/step - loss: 0.8755 - learning_rate: 5.0000e-04
+Epoch 11/100
+50/50 - 3s - 63ms/step - loss: 0.8739 - learning_rate: 5.0000e-04
+Epoch 12/100
+50/50 - 3s - 64ms/step - loss: 0.8692 - learning_rate: 5.0000e-04
+Epoch 13/100
+50/50 - 3s - 68ms/step - loss: 0.8685 - learning_rate: 5.0000e-04
+Epoch 14/100
+50/50 - 3s - 67ms/step - loss: 0.8674 - learning_rate: 5.0000e-04
+Epoch 15/100
+50/50 - 3s - 65ms/step - loss: 0.8662 - learning_rate: 5.0000e-04
+Epoch 16/100
+50/50 - 3s - 62ms/step - loss: 0.8645 - learning_rate: 5.0000e-04
+Epoch 17/100
+50/50 - 3s - 62ms/step - loss: 0.8647 - learning_rate: 5.0000e-04
+Epoch 18/100
+50/50 - 3s - 65ms/step - loss: 0.8633 - learning_rate: 5.0000e-04
+Epoch 19/100
+50/50 - 3s - 63ms/step - loss: 0.8633 - learning_rate: 5.0000e-04
+Epoch 20/100
+50/50 - 3s - 62ms/step - loss: 0.8619 - learning_rate: 5.0000e-04
+Epoch 21/100
+50/50 - 3s - 64ms/step - loss: 0.8606 - learning_rate: 5.0000e-04
+Epoch 22/100
+50/50 - 3s - 62ms/step - loss: 0.8601 - learning_rate: 5.0000e-04
+Epoch 23/100
+50/50 - 3s - 62ms/step - loss: 0.8595 - learning_rate: 5.0000e-04
+Epoch 24/100
+50/50 - 3s - 63ms/step - loss: 0.8589 - learning_rate: 5.0000e-04
+Epoch 25/100
+50/50 - 3s - 65ms/step - loss: 0.8582 - learning_rate: 5.0000e-04
+Epoch 26/100
+50/50 - 3s - 62ms/step - loss: 0.8588 - learning_rate: 5.0000e-04
+Epoch 27/100
+50/50 - 3s - 63ms/step - loss: 0.8589 - learning_rate: 5.0000e-04
+Epoch 28/100
+50/50 - 3s - 62ms/step - loss: 0.8579 - learning_rate: 5.0000e-04
+Epoch 29/100
+50/50 - 3s - 63ms/step - loss: 0.8578 - learning_rate: 5.0000e-04
+Epoch 30/100
+50/50 - 3s - 64ms/step - loss: 0.8572 - learning_rate: 5.0000e-04
+Epoch 31/100
+50/50 - 3s - 66ms/step - loss: 0.8570 - learning_rate: 5.0000e-04
+Epoch 32/100
+50/50 - 3s - 64ms/step - loss: 0.8556 - learning_rate: 5.0000e-04
+Epoch 33/100
+50/50 - 3s - 64ms/step - loss: 0.8560 - learning_rate: 5.0000e-04
+Epoch 34/100
+50/50 - 3s - 65ms/step - loss: 0.8559 - learning_rate: 5.0000e-04
+Epoch 35/100
+50/50 - 3s - 65ms/step - loss: 0.8559 - learning_rate: 5.0000e-04
+Epoch 36/100
+50/50 - 3s - 66ms/step - loss: 0.8566 - learning_rate: 5.0000e-04
+Epoch 37/100
+50/50 - 3s - 64ms/step - loss: 0.8563 - learning_rate: 5.0000e-04
+Epoch 38/100
+50/50 - 3s - 63ms/step - loss: 0.8560 - learning_rate: 5.0000e-04
+Epoch 39/100
+50/50 - 3s - 63ms/step - loss: 0.8559 - learning_rate: 5.0000e-04
+Epoch 40/100
+50/50 - 3s - 63ms/step - loss: 0.8540 - learning_rate: 2.5000e-04
+Epoch 41/100
+50/50 - 3s - 63ms/step - loss: 0.8535 - learning_rate: 2.5000e-04
+Epoch 42/100
+50/50 - 3s - 62ms/step - loss: 0.8532 - learning_rate: 2.5000e-04
+Epoch 43/100
+50/50 - 3s - 63ms/step - loss: 0.8531 - learning_rate: 2.5000e-04
+Epoch 44/100
+50/50 - 3s - 63ms/step - loss: 0.8531 - learning_rate: 2.5000e-04
+Epoch 45/100
+50/50 - 3s - 62ms/step - loss: 0.8530 - learning_rate: 2.5000e-04
+Epoch 46/100
+50/50 - 3s - 62ms/step - loss: 0.8529 - learning_rate: 2.5000e-04
+Epoch 47/100
+50/50 - 3s - 62ms/step - loss: 0.8526 - learning_rate: 2.5000e-04
+Epoch 48/100
+50/50 - 3s - 62ms/step - loss: 0.8530 - learning_rate: 2.5000e-04
+Epoch 49/100
+50/50 - 3s - 62ms/step - loss: 0.8528 - learning_rate: 2.5000e-04
+Epoch 50/100
+50/50 - 3s - 62ms/step - loss: 0.8526 - learning_rate: 2.5000e-04
+Epoch 51/100
+50/50 - 3s - 62ms/step - loss: 0.8525 - learning_rate: 2.5000e-04
+Epoch 52/100
+50/50 - 3s - 62ms/step - loss: 0.8526 - learning_rate: 2.5000e-04
+Epoch 53/100
+50/50 - 3s - 64ms/step - loss: 0.8525 - learning_rate: 2.5000e-04
+Epoch 54/100
+50/50 - 3s - 63ms/step - loss: 0.8524 - learning_rate: 2.5000e-04
+Epoch 55/100
+50/50 - 3s - 62ms/step - loss: 0.8523 - learning_rate: 2.5000e-04
+Epoch 56/100
+50/50 - 3s - 64ms/step - loss: 0.8524 - learning_rate: 2.5000e-04
+Epoch 57/100
+50/50 - 3s - 63ms/step - loss: 0.8526 - learning_rate: 2.5000e-04
+Epoch 58/100
+50/50 - 3s - 63ms/step - loss: 0.8524 - learning_rate: 2.5000e-04
+Epoch 59/100
+50/50 - 3s - 63ms/step - loss: 0.8524 - learning_rate: 2.5000e-04
+Epoch 60/100
+50/50 - 3s - 63ms/step - loss: 0.8522 - learning_rate: 2.5000e-04
+Epoch 61/100
+50/50 - 3s - 63ms/step - loss: 0.8524 - learning_rate: 2.5000e-04
+Epoch 62/100
+50/50 - 3s - 62ms/step - loss: 0.8522 - learning_rate: 2.5000e-04
+Epoch 63/100
+50/50 - 3s - 65ms/step - loss: 0.8522 - learning_rate: 2.5000e-04
+Epoch 64/100
+50/50 - 3s - 63ms/step - loss: 0.8519 - learning_rate: 2.5000e-04
+Epoch 65/100
+50/50 - 3s - 64ms/step - loss: 0.8518 - learning_rate: 2.5000e-04
+Epoch 66/100
+50/50 - 3s - 64ms/step - loss: 0.8519 - learning_rate: 2.5000e-04
+Epoch 67/100
+50/50 - 3s - 66ms/step - loss: 0.8522 - learning_rate: 2.5000e-04
+Epoch 68/100
+50/50 - 3s - 62ms/step - loss: 0.8521 - learning_rate: 2.5000e-04
+Epoch 69/100
+50/50 - 3s - 65ms/step - loss: 0.8520 - learning_rate: 2.5000e-04
+Epoch 70/100
+50/50 - 3s - 63ms/step - loss: 0.8519 - learning_rate: 2.5000e-04
+Epoch 71/100
+50/50 - 3s - 63ms/step - loss: 0.8518 - learning_rate: 2.5000e-04
+Epoch 72/100
+50/50 - 3s - 65ms/step - loss: 0.8516 - learning_rate: 2.5000e-04
+Epoch 73/100
+50/50 - 3s - 65ms/step - loss: 0.8527 - learning_rate: 2.5000e-04
+Epoch 74/100
+50/50 - 3s - 65ms/step - loss: 0.8526 - learning_rate: 2.5000e-04
+Epoch 75/100
+50/50 - 3s - 65ms/step - loss: 0.8519 - learning_rate: 2.5000e-04
+Epoch 76/100
+50/50 - 3s - 65ms/step - loss: 0.8521 - learning_rate: 2.5000e-04
+Epoch 77/100
+50/50 - 3s - 68ms/step - loss: 0.8518 - learning_rate: 2.5000e-04
+Epoch 78/100
+50/50 - 3s - 68ms/step - loss: 0.8516 - learning_rate: 2.5000e-04
+Epoch 79/100
+50/50 - 3s - 63ms/step - loss: 0.8514 - learning_rate: 2.5000e-04
+Epoch 80/100
+50/50 - 3s - 65ms/step - loss: 0.8514 - learning_rate: 2.5000e-04
+Epoch 81/100
+50/50 - 3s - 65ms/step - loss: 0.8513 - learning_rate: 2.5000e-04
+Epoch 82/100
+50/50 - 3s - 66ms/step - loss: 0.8514 - learning_rate: 2.5000e-04
+Epoch 83/100
+50/50 - 3s - 66ms/step - loss: 0.8514 - learning_rate: 2.5000e-04
+Epoch 84/100
+50/50 - 3s - 66ms/step - loss: 0.8516 - learning_rate: 2.5000e-04
+Epoch 85/100
+50/50 - 3s - 64ms/step - loss: 0.8517 - learning_rate: 2.5000e-04
+Epoch 86/100
+50/50 - 3s - 64ms/step - loss: 0.8516 - learning_rate: 2.5000e-04
+Epoch 87/100
+50/50 - 3s - 65ms/step - loss: 0.8510 - learning_rate: 1.2500e-04
+Epoch 88/100
+50/50 - 3s - 65ms/step - loss: 0.8508 - learning_rate: 1.2500e-04
+Epoch 89/100
+50/50 - 3s - 65ms/step - loss: 0.8505 - learning_rate: 1.2500e-04
+Epoch 90/100
+50/50 - 5s - 106ms/step - loss: 0.8505 - learning_rate: 1.2500e-04
+Epoch 91/100
+50/50 - 3s - 65ms/step - loss: 0.8505 - learning_rate: 1.2500e-04
+Epoch 92/100
+50/50 - 3s - 63ms/step - loss: 0.8504 - learning_rate: 1.2500e-04
+Epoch 93/100
+50/50 - 3s - 64ms/step - loss: 0.8504 - learning_rate: 1.2500e-04
+Epoch 94/100
+50/50 - 3s - 64ms/step - loss: 0.8504 - learning_rate: 1.2500e-04
+Epoch 95/100
+50/50 - 3s - 63ms/step - loss: 0.8503 - learning_rate: 1.2500e-04
+Epoch 96/100
+50/50 - 3s - 63ms/step - loss: 0.8504 - learning_rate: 1.2500e-04
+Epoch 97/100
+50/50 - 3s - 66ms/step - loss: 0.8503 - learning_rate: 1.2500e-04
+Epoch 98/100
+50/50 - 3s - 65ms/step - loss: 0.8503 - learning_rate: 1.2500e-04
+Epoch 99/100
+50/50 - 3s - 63ms/step - loss: 0.8503 - learning_rate: 1.2500e-04
+Epoch 100/100
+50/50 - 3s - 62ms/step - loss: 0.8503 - learning_rate: 1.2500e-04
+  parameters: 1,179,729
+  1.tif              Dice=0.1757  IoU=0.0963  P=0.247  R=0.136  Acc=0.9071
+
+[fold 2/6] fcn  (train 5, test 1)
+Epoch 1/100
+50/50 - 24s - 473ms/step - loss: 1.1581 - learning_rate: 5.0000e-04
+Epoch 2/100
+50/50 - 3s - 63ms/step - loss: 0.9522 - learning_rate: 5.0000e-04
+Epoch 3/100
+50/50 - 3s - 65ms/step - loss: 0.9229 - learning_rate: 5.0000e-04
+Epoch 4/100
+50/50 - 3s - 62ms/step - loss: 0.9089 - learning_rate: 5.0000e-04
+Epoch 5/100
+50/50 - 3s - 62ms/step - loss: 0.9014 - learning_rate: 5.0000e-04
+Epoch 6/100
+50/50 - 3s - 63ms/step - loss: 0.8947 - learning_rate: 5.0000e-04
+Epoch 7/100
+50/50 - 3s - 64ms/step - loss: 0.8886 - learning_rate: 5.0000e-04
+Epoch 8/100
+50/50 - 3s - 62ms/step - loss: 0.8885 - learning_rate: 5.0000e-04
+Epoch 9/100
+50/50 - 3s - 62ms/step - loss: 0.8836 - learning_rate: 5.0000e-04
+Epoch 10/100
+50/50 - 3s - 63ms/step - loss: 0.8813 - learning_rate: 5.0000e-04
+Epoch 11/100
+50/50 - 3s - 64ms/step - loss: 0.8785 - learning_rate: 5.0000e-04
+Epoch 12/100
+50/50 - 3s - 63ms/step - loss: 0.8780 - learning_rate: 5.0000e-04
+Epoch 13/100
+50/50 - 3s - 64ms/step - loss: 0.8750 - learning_rate: 5.0000e-04
+Epoch 14/100
+50/50 - 3s - 63ms/step - loss: 0.8732 - learning_rate: 5.0000e-04
+Epoch 15/100
+50/50 - 3s - 64ms/step - loss: 0.8732 - learning_rate: 5.0000e-04
+Epoch 16/100
+50/50 - 3s - 64ms/step - loss: 0.8720 - learning_rate: 5.0000e-04
+Epoch 17/100
+50/50 - 3s - 64ms/step - loss: 0.8700 - learning_rate: 5.0000e-04
+Epoch 18/100
+50/50 - 3s - 66ms/step - loss: 0.8686 - learning_rate: 5.0000e-04
+Epoch 19/100
+50/50 - 3s - 64ms/step - loss: 0.8683 - learning_rate: 5.0000e-04
+Epoch 20/100
+50/50 - 3s - 63ms/step - loss: 0.8681 - learning_rate: 5.0000e-04
+Epoch 21/100
+50/50 - 3s - 63ms/step - loss: 0.8671 - learning_rate: 5.0000e-04
+Epoch 22/100
+50/50 - 3s - 63ms/step - loss: 0.8668 - learning_rate: 5.0000e-04
+Epoch 23/100
+50/50 - 3s - 63ms/step - loss: 0.8647 - learning_rate: 5.0000e-04
+Epoch 24/100
+50/50 - 3s - 62ms/step - loss: 0.8663 - learning_rate: 5.0000e-04
+Epoch 25/100
+50/50 - 3s - 64ms/step - loss: 0.8651 - learning_rate: 5.0000e-04
+Epoch 26/100
+50/50 - 3s - 63ms/step - loss: 0.8642 - learning_rate: 5.0000e-04
+Epoch 27/100
+50/50 - 3s - 64ms/step - loss: 0.8642 - learning_rate: 5.0000e-04
+Epoch 28/100
+50/50 - 3s - 66ms/step - loss: 0.8635 - learning_rate: 5.0000e-04
+Epoch 29/100
+50/50 - 3s - 67ms/step - loss: 0.8629 - learning_rate: 5.0000e-04
+Epoch 30/100
+50/50 - 3s - 65ms/step - loss: 0.8627 - learning_rate: 5.0000e-04
+Epoch 31/100
+50/50 - 3s - 64ms/step - loss: 0.8623 - learning_rate: 5.0000e-04
+Epoch 32/100
+50/50 - 3s - 63ms/step - loss: 0.8624 - learning_rate: 5.0000e-04
+Epoch 33/100
+50/50 - 3s - 65ms/step - loss: 0.8618 - learning_rate: 5.0000e-04
+Epoch 34/100
+50/50 - 3s - 66ms/step - loss: 0.8612 - learning_rate: 5.0000e-04
+Epoch 35/100
+50/50 - 3s - 65ms/step - loss: 0.8618 - learning_rate: 5.0000e-04
+Epoch 36/100
+50/50 - 3s - 65ms/step - loss: 0.8615 - learning_rate: 5.0000e-04
+Epoch 37/100
+50/50 - 3s - 66ms/step - loss: 0.8615 - learning_rate: 5.0000e-04
+Epoch 38/100
+50/50 - 3s - 64ms/step - loss: 0.8612 - learning_rate: 5.0000e-04
+Epoch 39/100
+50/50 - 3s - 62ms/step - loss: 0.8612 - learning_rate: 5.0000e-04
+Epoch 40/100
+50/50 - 3s - 63ms/step - loss: 0.8604 - learning_rate: 5.0000e-04
+Epoch 41/100
+50/50 - 3s - 64ms/step - loss: 0.8606 - learning_rate: 5.0000e-04
+Epoch 42/100
+50/50 - 3s - 63ms/step - loss: 0.8605 - learning_rate: 5.0000e-04
+Epoch 43/100
+50/50 - 3s - 63ms/step - loss: 0.8603 - learning_rate: 5.0000e-04
+Epoch 44/100
+50/50 - 3s - 63ms/step - loss: 0.8598 - learning_rate: 5.0000e-04
+Epoch 45/100
+50/50 - 3s - 64ms/step - loss: 0.8601 - learning_rate: 5.0000e-04
+Epoch 46/100
+50/50 - 3s - 64ms/step - loss: 0.8600 - learning_rate: 5.0000e-04
+Epoch 47/100
+50/50 - 3s - 65ms/step - loss: 0.8595 - learning_rate: 5.0000e-04
+Epoch 48/100
+50/50 - 3s - 64ms/step - loss: 0.8594 - learning_rate: 5.0000e-04
+Epoch 49/100
+50/50 - 3s - 63ms/step - loss: 0.8595 - learning_rate: 5.0000e-04
+Epoch 50/100
+50/50 - 3s - 65ms/step - loss: 0.8598 - learning_rate: 5.0000e-04
+Epoch 51/100
+50/50 - 3s - 63ms/step - loss: 0.8590 - learning_rate: 5.0000e-04
+Epoch 52/100
+50/50 - 3s - 64ms/step - loss: 0.8596 - learning_rate: 5.0000e-04
+Epoch 53/100
+50/50 - 3s - 62ms/step - loss: 0.8598 - learning_rate: 5.0000e-04
+Epoch 54/100
+50/50 - 3s - 63ms/step - loss: 0.8592 - learning_rate: 5.0000e-04
+Epoch 55/100
+50/50 - 3s - 63ms/step - loss: 0.8593 - learning_rate: 5.0000e-04
+Epoch 56/100
+50/50 - 3s - 62ms/step - loss: 0.8589 - learning_rate: 5.0000e-04
+Epoch 57/100
+50/50 - 3s - 63ms/step - loss: 0.8588 - learning_rate: 5.0000e-04
+Epoch 58/100
+50/50 - 3s - 63ms/step - loss: 0.8584 - learning_rate: 5.0000e-04
+Epoch 59/100
+50/50 - 3s - 63ms/step - loss: 0.8585 - learning_rate: 5.0000e-04
+Epoch 60/100
+50/50 - 3s - 65ms/step - loss: 0.8580 - learning_rate: 5.0000e-04
+Epoch 61/100
+50/50 - 3s - 64ms/step - loss: 0.8584 - learning_rate: 5.0000e-04
+Epoch 62/100
+50/50 - 3s - 63ms/step - loss: 0.8587 - learning_rate: 5.0000e-04
+Epoch 63/100
+50/50 - 3s - 64ms/step - loss: 0.8584 - learning_rate: 5.0000e-04
+Epoch 64/100
+50/50 - 3s - 64ms/step - loss: 0.8582 - learning_rate: 5.0000e-04
+Epoch 65/100
+50/50 - 3s - 62ms/step - loss: 0.8585 - learning_rate: 5.0000e-04
+Epoch 66/100
+50/50 - 3s - 63ms/step - loss: 0.8586 - learning_rate: 5.0000e-04
+Epoch 67/100
+50/50 - 3s - 63ms/step - loss: 0.8579 - learning_rate: 5.0000e-04
+Epoch 68/100
+50/50 - 3s - 64ms/step - loss: 0.8574 - learning_rate: 2.5000e-04
+Epoch 69/100
+50/50 - 3s - 63ms/step - loss: 0.8570 - learning_rate: 2.5000e-04
+Epoch 70/100
+50/50 - 3s - 63ms/step - loss: 0.8570 - learning_rate: 2.5000e-04
+Epoch 71/100
+50/50 - 3s - 66ms/step - loss: 0.8569 - learning_rate: 2.5000e-04
+Epoch 72/100
+50/50 - 3s - 63ms/step - loss: 0.8566 - learning_rate: 2.5000e-04
+Epoch 73/100
+50/50 - 3s - 64ms/step - loss: 0.8567 - learning_rate: 2.5000e-04
+Epoch 74/100
+50/50 - 3s - 69ms/step - loss: 0.8568 - learning_rate: 2.5000e-04
+Epoch 75/100
+50/50 - 4s - 73ms/step - loss: 0.8567 - learning_rate: 2.5000e-04
+Epoch 76/100
+50/50 - 4s - 72ms/step - loss: 0.8566 - learning_rate: 2.5000e-04
+Epoch 77/100
+50/50 - 4s - 71ms/step - loss: 0.8564 - learning_rate: 2.5000e-04
+Epoch 78/100
+50/50 - 4s - 71ms/step - loss: 0.8566 - learning_rate: 2.5000e-04
+Epoch 79/100
+50/50 - 4s - 70ms/step - loss: 0.8565 - learning_rate: 2.5000e-04
+Epoch 80/100
+50/50 - 3s - 69ms/step - loss: 0.8567 - learning_rate: 2.5000e-04
+Epoch 81/100
+50/50 - 3s - 67ms/step - loss: 0.8566 - learning_rate: 2.5000e-04
+Epoch 82/100
+50/50 - 3s - 70ms/step - loss: 0.8565 - learning_rate: 2.5000e-04
+Epoch 83/100
+50/50 - 4s - 72ms/step - loss: 0.8564 - learning_rate: 2.5000e-04
+Epoch 84/100
+50/50 - 4s - 72ms/step - loss: 0.8565 - learning_rate: 2.5000e-04
+Epoch 85/100
+50/50 - 3s - 68ms/step - loss: 0.8563 - learning_rate: 1.2500e-04
+Epoch 86/100
+50/50 - 3s - 67ms/step - loss: 0.8562 - learning_rate: 1.2500e-04
+Epoch 87/100
+50/50 - 3s - 66ms/step - loss: 0.8561 - learning_rate: 1.2500e-04
+Epoch 88/100
+50/50 - 3s - 63ms/step - loss: 0.8561 - learning_rate: 1.2500e-04
+Epoch 89/100
+50/50 - 3s - 66ms/step - loss: 0.8560 - learning_rate: 1.2500e-04
+Epoch 90/100
+50/50 - 3s - 62ms/step - loss: 0.8561 - learning_rate: 1.2500e-04
+Epoch 91/100
+50/50 - 3s - 67ms/step - loss: 0.8560 - learning_rate: 1.2500e-04
+Epoch 92/100
+50/50 - 3s - 63ms/step - loss: 0.8560 - learning_rate: 1.2500e-04
+Epoch 93/100
+50/50 - 3s - 63ms/step - loss: 0.8559 - learning_rate: 1.2500e-04
+Epoch 94/100
+50/50 - 3s - 64ms/step - loss: 0.8560 - learning_rate: 1.2500e-04
+Epoch 95/100
+50/50 - 3s - 62ms/step - loss: 0.8559 - learning_rate: 1.2500e-04
+Epoch 96/100
+50/50 - 3s - 63ms/step - loss: 0.8560 - learning_rate: 1.2500e-04
+Epoch 97/100
+50/50 - 3s - 63ms/step - loss: 0.8559 - learning_rate: 6.2500e-05
+Epoch 98/100
+50/50 - 3s - 64ms/step - loss: 0.8558 - learning_rate: 6.2500e-05
+Epoch 99/100
+50/50 - 3s - 63ms/step - loss: 0.8558 - learning_rate: 6.2500e-05
+Epoch 100/100
+50/50 - 3s - 62ms/step - loss: 0.8558 - learning_rate: 6.2500e-05
+  2.tif              Dice=0.1841  IoU=0.1014  P=0.288  R=0.135  Acc=0.9129
+
+[fold 3/6] fcn  (train 5, test 1)
+Epoch 1/100
+50/50 - 21s - 430ms/step - loss: 1.1684 - learning_rate: 5.0000e-04
+Epoch 2/100
+50/50 - 3s - 62ms/step - loss: 0.9592 - learning_rate: 5.0000e-04
+Epoch 3/100
+50/50 - 3s - 62ms/step - loss: 0.9377 - learning_rate: 5.0000e-04
+Epoch 4/100
+50/50 - 3s - 62ms/step - loss: 0.9285 - learning_rate: 5.0000e-04
+Epoch 5/100
+50/50 - 3s - 62ms/step - loss: 0.9176 - learning_rate: 5.0000e-04
+Epoch 6/100
+50/50 - 3s - 62ms/step - loss: 0.9072 - learning_rate: 5.0000e-04
+Epoch 7/100
+50/50 - 3s - 62ms/step - loss: 0.9030 - learning_rate: 5.0000e-04
+Epoch 8/100
+50/50 - 4s - 77ms/step - loss: 0.8990 - learning_rate: 5.0000e-04
+Epoch 9/100
+50/50 - 3s - 64ms/step - loss: 0.8951 - learning_rate: 5.0000e-04
+Epoch 10/100
+50/50 - 1660s - 33s/step - loss: 0.8916 - learning_rate: 5.0000e-04
+Epoch 11/100
+50/50 - 3s - 64ms/step - loss: 0.8908 - learning_rate: 5.0000e-04
+Epoch 12/100
+50/50 - 3s - 60ms/step - loss: 0.8871 - learning_rate: 5.0000e-04
+Epoch 13/100
+50/50 - 3s - 63ms/step - loss: 0.8862 - learning_rate: 5.0000e-04
+Epoch 14/100
+50/50 - 3s - 69ms/step - loss: 0.8834 - learning_rate: 5.0000e-04
+Epoch 15/100
+50/50 - 3s - 64ms/step - loss: 0.8817 - learning_rate: 5.0000e-04
+Epoch 16/100
+50/50 - 3s - 60ms/step - loss: 0.8825 - learning_rate: 5.0000e-04
+Epoch 17/100
+50/50 - 3s - 63ms/step - loss: 0.8823 - learning_rate: 5.0000e-04
+Epoch 18/100
+50/50 - 3s - 64ms/step - loss: 0.8805 - learning_rate: 5.0000e-04
+Epoch 19/100
+50/50 - 3s - 65ms/step - loss: 0.8794 - learning_rate: 5.0000e-04
+Epoch 20/100
+50/50 - 3s - 64ms/step - loss: 0.8790 - learning_rate: 5.0000e-04
+Epoch 21/100
+50/50 - 3s - 68ms/step - loss: 0.8773 - learning_rate: 5.0000e-04
+Epoch 22/100
+50/50 - 3s - 62ms/step - loss: 0.8763 - learning_rate: 5.0000e-04
+Epoch 23/100
+50/50 - 3s - 62ms/step - loss: 0.8763 - learning_rate: 5.0000e-04
+Epoch 24/100
+50/50 - 3s - 62ms/step - loss: 0.8763 - learning_rate: 5.0000e-04
+Epoch 25/100
+50/50 - 3s - 65ms/step - loss: 0.8751 - learning_rate: 5.0000e-04
+Epoch 26/100
+50/50 - 3s - 67ms/step - loss: 0.8752 - learning_rate: 5.0000e-04
+Epoch 27/100
+50/50 - 3s - 65ms/step - loss: 0.8754 - learning_rate: 5.0000e-04
+Epoch 28/100
+50/50 - 3s - 64ms/step - loss: 0.8749 - learning_rate: 5.0000e-04
+Epoch 29/100
+50/50 - 3s - 63ms/step - loss: 0.8740 - learning_rate: 5.0000e-04
+Epoch 30/100
+50/50 - 3s - 63ms/step - loss: 0.8732 - learning_rate: 5.0000e-04
+Epoch 31/100
+50/50 - 3s - 63ms/step - loss: 0.8737 - learning_rate: 5.0000e-04
+Epoch 32/100
+50/50 - 3s - 63ms/step - loss: 0.8727 - learning_rate: 5.0000e-04
+Epoch 33/100
+50/50 - 3s - 64ms/step - loss: 0.8728 - learning_rate: 5.0000e-04
+Epoch 34/100
+50/50 - 3s - 63ms/step - loss: 0.8718 - learning_rate: 5.0000e-04
+Epoch 35/100
+50/50 - 3s - 63ms/step - loss: 0.8718 - learning_rate: 5.0000e-04
+Epoch 36/100
+50/50 - 3s - 64ms/step - loss: 0.8715 - learning_rate: 5.0000e-04
+Epoch 37/100

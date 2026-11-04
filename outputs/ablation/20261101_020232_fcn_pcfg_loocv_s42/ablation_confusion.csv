@@ -1,0 +1,2 @@
+model,tp,fp,fn,tn,fp_over_fn,behaviour
+fcn,7313,12733,22758,350412,0.559,under-segmentation (FN > FP)

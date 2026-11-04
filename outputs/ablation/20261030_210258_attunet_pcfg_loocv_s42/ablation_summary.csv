@@ -1,0 +1,2 @@
+model,dice_mean,dice_std,iou_mean,iou_std,precision_mean,precision_std,recall_mean,recall_std,accuracy_mean,accuracy_std
+attunet,0.8048,0.0615,0.6768,0.0813,0.8348,0.1302,0.8264,0.1879,0.9706,0.0062

@@ -1,0 +1,71 @@
+{
+  "command": "ablation_study.py --models resunet",
+  "args": {
+    "epochs": null,
+    "folds": null,
+    "seed": null,
+    "models": [
+      "resunet"
+    ],
+    "ref": "unet",
+    "full_images": false,
+    "filters": null,
+    "match_params": false,
+    "light": false,
+    "patch": null,
+    "name": null
+  },
+  "epochs": 100,
+  "seed": 42,
+  "cv": "LOOCV",
+  "n_folds": 6,
+  "trained_models": [
+    "resunet"
+  ],
+  "stats_reference": "unet",
+  "images": [
+    "1.tif",
+    "2.tif",
+    "3.tif",
+    "4.tif",
+    "5.tif",
+    "6.tif"
+  ],
+  "folds_test": [
+    [
+      "1.tif"
+    ],
+    [
+      "2.tif"
+    ],
+    [
+      "3.tif"
+    ],
+    [
+      "4.tif"
+    ],
+    [
+      "5.tif"
+    ],
+    [
+      "6.tif"
+    ]
+  ],
+  "training_on": "patches",
+  "base_filters": 16,
+  "variant_filters": {},
+  "depth": 4,
+  "parameters": {
+    "resunet": 2078513
+  },
+  "image_size": [
+    256,
+    256
+  ],
+  "patch_size": 256,
+  "patch_stride": 128,
+  "batch_size": 2,
+  "augment_repeats": 20,
+  "learning_rate": 0.0005,
+  "prob_threshold": 0.5
+}

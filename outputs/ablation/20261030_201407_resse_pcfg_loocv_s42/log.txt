@@ -1,0 +1,50 @@
+Run folder: /home/harsh/CV_work/group_8/outputs/ablation/20261030_201407_resse_pcfg_loocv_s42
+
+Models: resse
+6 images, LOOCV (6 folds, seed=42), 100 epochs/fold, patches
+  fold 1: test = ['1.tif']
+  fold 2: test = ['2.tif']
+  fold 3: test = ['3.tif']
+  fold 4: test = ['4.tif']
+  fold 5: test = ['5.tif']
+  fold 6: test = ['6.tif']
+
+[fold 1/6] ResUNet+SE  (train 5, test 1)
+  training patches: 5 of shape (256, 256), repeats=20, ~50 steps/epoch
+  parameters: 2,106,737
+  1.tif              Dice=0.8797  IoU=0.7852  P=0.885  R=0.874  Acc=0.9826
+
+[fold 2/6] ResUNet+SE  (train 5, test 1)
+  2.tif              Dice=0.8610  IoU=0.7560  P=0.892  R=0.832  Acc=0.9805
+
+[fold 3/6] ResUNet+SE  (train 5, test 1)
+  3.tif              Dice=0.8818  IoU=0.7885  P=0.822  R=0.951  Acc=0.9809
+
+[fold 4/6] ResUNet+SE  (train 5, test 1)
+  4.tif              Dice=0.8990  IoU=0.8165  P=0.880  R=0.919  Acc=0.9847
+
+[fold 5/6] ResUNet+SE  (train 5, test 1)
+  5.tif              Dice=0.7335  IoU=0.5792  P=0.998  R=0.580  Acc=0.9644
+
+[fold 6/6] ResUNet+SE  (train 5, test 1)
+  6.tif              Dice=0.8852  IoU=0.7941  P=0.972  R=0.813  Acc=0.9831
+
+============================================================================================
+  MEAN +/- STD OVER FOLDS (each fold = one value)
+============================================================================================
+  Model                         dice             iou       precision          recall        accuracy
+  ResUNet+SE          0.857+/-0.062  0.753+/-0.087  0.908+/-0.065  0.828+/-0.132  0.979+/-0.008
+
+============================================================================================
+  POOLED CONFUSION COUNTS (all test images) AND SEGMENTATION BEHAVIOUR
+============================================================================================
+  Model                     TP        FP        FN          TN   FP/FN  Behaviour
+  ResUNet+SE             24723      2763      5348      360382    0.52  under-segmentation (FN > FP)
+
+  Note: accuracy is dominated by the large background class (TN), so it is
+  high for every model; Dice / IoU / precision / recall are more informative.
+  Violin plot saved: /home/harsh/CV_work/group_8/outputs/ablation/20261030_201407_resse_pcfg_loocv_s42/ablation_violins.png
+  Prediction grid saved: /home/harsh/CV_work/group_8/outputs/ablation/20261030_201407_resse_pcfg_loocv_s42/ablation_predictions.png
+  Error-map grid saved: /home/harsh/CV_work/group_8/outputs/ablation/20261030_201407_resse_pcfg_loocv_s42/ablation_errors.png
+
+All outputs of this run saved in: /home/harsh/CV_work/group_8/outputs/ablation/20261030_201407_resse_pcfg_loocv_s42

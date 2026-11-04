@@ -1,0 +1,2 @@
+model,tp,fp,fn,tn,fp_over_fn,behaviour
+attunet,24559,6053,5512,357092,1.098,balanced

@@ -1,0 +1,2 @@
+model,dice_mean,dice_std,iou_mean,iou_std,precision_mean,precision_std,recall_mean,recall_std,accuracy_mean,accuracy_std
+fcn,0.2796,0.1123,0.1667,0.0766,0.3632,0.1283,0.2392,0.1116,0.9097,0.0133

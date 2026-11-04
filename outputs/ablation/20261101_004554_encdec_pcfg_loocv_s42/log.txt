@@ -1,0 +1,14 @@
+Run folder: /home/harsh/CV_work/group_8/outputs/ablation/20261101_004554_encdec_pcfg_loocv_s42
+
+Models: encdec
+6 images, LOOCV (6 folds, seed=42), 100 epochs/fold, patches
+  fold 1: test = ['1.tif']
+  fold 2: test = ['2.tif']
+  fold 3: test = ['3.tif']
+  fold 4: test = ['4.tif']
+  fold 5: test = ['5.tif']
+  fold 6: test = ['6.tif']
+
+[fold 1/6] Enc-Dec  (train 5, test 1)
+  training on patches: 5 of shape (256, 256), repeats=20, ~50 steps/epoch
+Epoch 1/100

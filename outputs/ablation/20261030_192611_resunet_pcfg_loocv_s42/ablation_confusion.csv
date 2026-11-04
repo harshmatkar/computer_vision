@@ -1,0 +1,2 @@
+model,tp,fp,fn,tn,fp_over_fn,behaviour
+resunet,23230,7814,6841,355331,1.142,balanced
